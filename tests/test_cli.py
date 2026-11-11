@@ -6,7 +6,8 @@ SPECS = Path(__file__).resolve().parents[1] / "specs"
 
 
 def test_plan_cli(capsys) -> None:
-    rc = main(["plan", str(SPECS / "qsa-vs-dense.yaml"), "--profile", "quick"])
+    # Pin MemAvailable: without it, access.mode local reads this machine's /proc/meminfo.
+    rc = main(["plan", str(SPECS / "qsa-vs-dense.yaml"), "--profile", "quick", "--mem-available", "64"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "Plan for" in out
