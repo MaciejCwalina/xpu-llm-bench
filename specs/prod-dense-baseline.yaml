@@ -5,8 +5,6 @@ profile: full
 kind: run
 endpoint:
   base_url: http://127.0.0.1:8000/v1  # TODO: confirm test-container port
-  metrics_url: http://127.0.0.1:8000/metrics
-  health_url: http://127.0.0.1:8000/health
   tokenize_url: http://127.0.0.1:8000/tokenize
   api_key_env: OPENAI_API_KEY
   model: TODO-served-model-name  # the served model name
@@ -37,17 +35,11 @@ server:
   max_num_batched_tokens: null  # TODO
   gpu_memory_utilization: null  # TODO
 hardware:
-  gpu_model: Intel Arc Pro B60
-  gpu_count: 2
   tensor_parallel: 2
-  host_ram_gib: 25
-  mem_available_floor_gib: 2
 access:
   mode: local  # TODO: "ssh" if the runner is driven from another machine; do not put IPs here
 safety:
-  hold_name: xpu-llm-bench-dense-baseline
   hold_minutes: 180
-  hold_reason: xpu-llm-bench prod dense baseline
   never_use_xpu_smi: true
   allowed_containers: [vllm-bench-dense-baseline]
 prompts:

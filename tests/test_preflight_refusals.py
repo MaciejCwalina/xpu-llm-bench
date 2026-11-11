@@ -82,7 +82,7 @@ def test_cli_reports_refusal_without_traceback(monkeypatch, tmp_path: Path, caps
 
     def boom(*a, **k):
         man = RunManifest.model_validate({
-            "run_id": "r", "spec_name": "s", "profile": "custom", "started_utc": "", "started_et": "",
+            "run_id": "r", "spec_name": "s", "profile": "custom", "started_utc": "", "started_local": "",
             "hardware": {}, "status": "refused", "output_jsonl": str(tmp_path / "results.jsonl"),
         })
         raise RunRefused("Refusing to start: bench-hold is held by 'someone-else'", man)

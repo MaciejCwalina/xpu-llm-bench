@@ -79,92 +79,123 @@ def estimate_seconds(spec: RunSpec, rungs: list[Rung]) -> float:
     return total
 
 
-def feasibility(spec: RunSpec, rungs: list[Rung], measured_host_gib: float | None = None) -> Feasibility:
+def feasibility(
+    spec: RunSpec,
+    rungs: list[Rung],
+    mem_available_gib: float | None = None,
+    basis: str = "live",
+) -> Feasibility:
     """GPU and host-RAM feasibility of the planned peak.
 
     GPU: weights + KV(peak live tokens) + device overhead against
-    gpu_count x gpu_mem_gib. Host: server-process RAM (measured RSS when
-    given, else the planner ESTIMATE) plus any host-resident KV share,
-    against host_ram_gib minus the MemAvailable floor.
+    gpu_count x gpu_mem_gib (skipped, with a warning, if either is unknown).
+
+    Host: the run's host-RAM growth (peak live tokens x
+    planner.host_bytes_per_token, plus any host-resident KV share) against
+    MemAvailable *now* minus the floor. MemAvailable already accounts for the
+    booted server and every other resident process. ``mem_available_gib``
+    comes from a live reading (plan with access.mode local, or preflight) or
+    a measured baseline from an earlier run's results. Without a reading the
+    host check is UNVERIFIED (a warning), never OK.
     """
     a = spec.planner
     hw = spec.hardware
     peak_tokens = peak_live_tokens(rungs)
     kv = (peak_tokens * a.assumed_kv_bytes_per_token) / GiB
     gpu_need = kv + a.assumed_weight_gib + a.assumed_fixed_overhead_gib
-    gpu_total = hw.gpu_count * hw.gpu_mem_gib
     notes = [
-        "KV and GPU figures are planner ESTIMATES (assumed bytes/token and weight size), not measurements.",
+        "KV, GPU and per-token host-RAM figures are planner ESTIMATES (planner.*), not measurements.",
         "Host RAM floor is MemAvailable, not a cgroup max. A run aborts if MemAvailable hits the floor.",
         "Peak live tokens assumes sessions stay resident when quiesced (prefix cache retained).",
     ]
-    if gpu_need > gpu_total * a.gpu_fail_frac:
-        gpu_status = "fail"
+    gpu_total = 0.0
+    if not hw.gpu_count or not hw.gpu_mem_gib:
+        gpu_status = "unknown"
         notes.append(
-            f"FAIL GPU: estimated weights+KV+overhead {gpu_need:.1f} GiB exceeds "
-            f"{a.gpu_fail_frac:.0%} of {gpu_total:.0f} GiB ({hw.gpu_count} x {hw.gpu_mem_gib:.0f} GiB). "
-            "Lower the top context rung or concurrency."
-        )
-    elif gpu_need > gpu_total * a.gpu_warn_frac:
-        gpu_status = "tight"
-        notes.append(
-            f"WARN GPU: estimated {gpu_need:.1f} GiB is over {a.gpu_warn_frac:.0%} of {gpu_total:.0f} GiB; "
-            "expect preemption or KV pressure at the peak."
+            "WARN GPU: hardware.gpu_count / gpu_mem_gib not set (site config `hardware:`); "
+            f"GPU fit not checked (estimated need {gpu_need:.1f} GiB)."
         )
     else:
-        gpu_status = "ok"
-    if measured_host_gib is not None and measured_host_gib > 0:
-        proc_gib, basis = measured_host_gib, "measured"
+        gpu_total = hw.gpu_count * hw.gpu_mem_gib
+        if gpu_need > gpu_total * a.gpu_fail_frac:
+            gpu_status = "fail"
+            notes.append(
+                f"FAIL GPU: estimated weights+KV+overhead {gpu_need:.1f} GiB exceeds "
+                f"{a.gpu_fail_frac:.0%} of {gpu_total:.0f} GiB ({hw.gpu_count} x {hw.gpu_mem_gib:.0f} GiB). "
+                "Lower the top context rung or concurrency."
+            )
+        elif gpu_need > gpu_total * a.gpu_warn_frac:
+            gpu_status = "tight"
+            notes.append(
+                f"WARN GPU: estimated {gpu_need:.1f} GiB is over {a.gpu_warn_frac:.0%} of {gpu_total:.0f} GiB; "
+                "expect preemption or KV pressure at the peak."
+            )
+        else:
+            gpu_status = "ok"
+
+    host_need = (peak_tokens * a.host_bytes_per_token) / GiB + kv * a.host_kv_fraction
+    floor = hw.mem_available_floor_gib
+    if mem_available_gib is None:
+        host_status, host_basis, host_budget = "unverified", "none", 0.0
+        notes.append(
+            f"WARN host RAM: no MemAvailable reading, so the run's estimated host growth "
+            f"({host_need:.1f} GiB) is NOT checked. Plan on the bench host (access.mode local), pass "
+            "`--mem-available GIB` or `--measured <results.jsonl>`; a live run re-checks at preflight."
+        )
     else:
-        proc_gib, basis = a.assumed_host_process_gib, "estimate"
-    host_need = proc_gib + kv * a.host_kv_fraction
-    host_budget = hw.host_ram_gib - hw.mem_available_floor_gib
-    if host_need > host_budget:
-        host_status = "fail"
-        notes.append(
-            f"FAIL host RAM: server processes {proc_gib:.1f} GiB ({basis}) + host KV "
-            f"{kv * a.host_kv_fraction:.1f} GiB = {host_need:.1f} GiB exceeds the "
-            f"{host_budget:.1f} GiB left above the {hw.mem_available_floor_gib:.1f} GiB MemAvailable floor."
-        )
-    elif host_budget - host_need < a.host_tight_gib:
-        host_status = "tight"
-        notes.append(
-            f"WARN host RAM: {host_need:.1f} GiB ({basis}) leaves only "
-            f"{host_budget - host_need:.1f} GiB above the MemAvailable floor."
-        )
-    else:
-        host_status = "ok"
-    if basis == "estimate":
-        notes.append(
-            f"Host process RAM is the planner ESTIMATE ({proc_gib:.1f} GiB). Pass "
-            "`bench plan --measured <results.jsonl>` to use measured RSS; a live run re-checks "
-            "with the server's measured RSS at preflight."
-        )
+        host_basis = basis
+        host_budget = mem_available_gib - floor
+        if host_need > host_budget:
+            host_status = "fail"
+            notes.append(
+                f"FAIL host RAM: estimated growth {host_need:.1f} GiB (peak {peak_tokens:,} live tokens x "
+                f"{a.host_bytes_per_token / 1024:.0f} KiB) exceeds MemAvailable {mem_available_gib:.1f} GiB "
+                f"({basis}) minus the {floor:.1f} GiB floor = {host_budget:.1f} GiB."
+            )
+        elif host_budget - host_need < a.host_tight_gib:
+            host_status = "tight"
+            notes.append(
+                f"WARN host RAM: estimated growth {host_need:.1f} GiB leaves only "
+                f"{host_budget - host_need:.1f} GiB above the floor (MemAvailable {mem_available_gib:.1f} GiB, {basis})."
+            )
+        else:
+            host_status = "ok"
     return Feasibility(
         peak_live_tokens=peak_tokens,
         estimated_kv_gib=kv,
         estimated_total_gib=gpu_need,
-        host_ram_gib=hw.host_ram_gib,
-        mem_floor_gib=hw.mem_available_floor_gib,
+        host_ram_gib=hw.host_ram_gib or 0.0,
+        mem_floor_gib=floor,
         host_ram_ok=host_status != "fail",
         gpu_total_gib=gpu_total,
         gpu_status=gpu_status,
         host_need_gib=host_need,
         host_budget_gib=host_budget,
         host_status=host_status,
-        host_basis=basis,
+        host_basis=host_basis,
         notes=notes,
     )
 
 
-def measured_host_gib_from_rows(rows: list) -> float | None:
-    """Peak summed server RSS (GiB) across result rows that recorded rss_kib."""
-    best = 0.0
+def baseline_mem_available_from_rows(rows: list) -> float | None:
+    """MemAvailable (GiB) measured on the earliest row of an earlier run on the
+    same host: the server was booted and the context was smallest there."""
     for row in rows:
-        rss = getattr(row, "rss_kib", None) or {}
-        total = sum(int(v) for v in rss.values() if v)
-        best = max(best, total / (1024 * 1024))
-    return best or None
+        val = getattr(row, "mem_available_min_gib", None)
+        if val:
+            return float(val)
+    return None
+
+
+def local_mem_available_gib(path: str = "/proc/meminfo") -> float | None:
+    try:
+        text = open(path, encoding="utf-8").read()  # noqa: SIM115
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / (1024 * 1024)
+    return None
 
 
 GRID_WARNING = (
@@ -174,7 +205,7 @@ GRID_WARNING = (
 )
 
 
-def make_plan(spec: RunSpec, measured_host_gib: float | None = None) -> Plan:
+def make_plan(spec: RunSpec, mem_available_gib: float | None = None, basis: str = "live") -> Plan:
     rungs = build_schedule(spec)
     issues = validate_progressive(rungs)
     if spec.ladder.shape == "grid":
@@ -194,7 +225,7 @@ def make_plan(spec: RunSpec, measured_host_gib: float | None = None) -> Plan:
         estimated_seconds=seconds,
         target_minutes=target,
         fits_target=fits,
-        feasibility=(feas := feasibility(spec, rungs, measured_host_gib)),
+        feasibility=(feas := feasibility(spec, rungs, mem_available_gib, basis)),
         issues=issues + feas.failures,
     )
 
@@ -221,14 +252,19 @@ def format_plan(plan: Plan) -> str:
     lines.append(
         f"Peak live tokens: {feas.peak_live_tokens:,}  "
         f"est. KV: {feas.estimated_kv_gib:.2f} GiB  "
-        f"est. GPU weights+KV+overhead: {feas.estimated_total_gib:.2f} / {feas.gpu_total_gib:.0f} GiB "
-        f"({feas.gpu_status.upper()})"
+        f"est. GPU weights+KV+overhead: {feas.estimated_total_gib:.2f} / "
+        f"{(f'{feas.gpu_total_gib:.0f}' if feas.gpu_total_gib else '?')} GiB ({feas.gpu_status.upper()})"
     )
-    lines.append(
-        f"Host RAM: need {feas.host_need_gib:.1f} GiB ({feas.host_basis}) of "
-        f"{feas.host_budget_gib:.1f} GiB usable ({feas.host_ram_gib:.1f} GiB minus a "
-        f"{feas.mem_floor_gib:.1f} GiB MemAvailable floor) ({feas.host_status.upper()})"
-    )
+    if feas.host_status == "unverified":
+        lines.append(
+            f"Host RAM: est. growth {feas.host_need_gib:.1f} GiB vs MemAvailable: no reading (UNVERIFIED)"
+        )
+    else:
+        lines.append(
+            f"Host RAM: est. growth {feas.host_need_gib:.1f} GiB of {feas.host_budget_gib:.1f} GiB "
+            f"(MemAvailable {feas.host_budget_gib + feas.mem_floor_gib:.1f} GiB {feas.host_basis} minus a "
+            f"{feas.mem_floor_gib:.1f} GiB floor) ({feas.host_status.upper()})"
+        )
     lines.append("")
     lines.append(
         "Order (progressive; context never shrinks within a prompt-type family):"

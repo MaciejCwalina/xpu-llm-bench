@@ -5,7 +5,6 @@ profile: custom
 kind: comparison
 endpoint:
   base_url: http://127.0.0.1:8000/v1  # TODO
-  metrics_url: http://127.0.0.1:8000/metrics
   api_key_env: OPENAI_API_KEY
   model: TODO-served-model-name
 server:
@@ -27,14 +26,10 @@ server:
     num_speculative_tokens: 6
   max_num_seqs: 8
 hardware:
-  gpu_count: 2
   tensor_parallel: 2
-  host_ram_gib: 25
-  mem_available_floor_gib: 2
 access:
   mode: local  # TODO
 safety:
-  hold_name: xpu-llm-bench-width-clamp
   hold_minutes: 180
   allowed_containers: [vllm-bench-width-clamp-before, vllm-bench-width-clamp-after]
 prompts:
@@ -56,7 +51,7 @@ ladder:
 # Variants here share one endpoint, so run them one at a time:
 #   bench run SPEC --variant NAME            (boot that variant first), or
 #   bench run SPEC --pause-between-variants  (prompts you to reboot between them),
-# or give each variant its own endpoint: {base_url, metrics_url, health_url}.
+# or give each variant its own endpoint: {base_url} (metrics_url / health_url follow it unless set).
 variants:
   - name: before
     container_name: vllm-bench-width-clamp-before

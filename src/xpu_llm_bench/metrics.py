@@ -254,7 +254,7 @@ def true_hit_rate(delivered: float | None, verify_steps: float | None, k: int | 
     target-model verify passes that produced them. Each verify step yields one
     bonus/verified token plus 0..k accepted drafts, so this is the fraction of
     proposed draft slots that became delivered tokens. It does not read the
-    accepted-tokens counter (which reported 107% on production on 2026-11-08).
+    accepted-tokens counter, which some builds over-report (accepted > drafted).
     """
     if delivered is None or verify_steps is None or not k or verify_steps <= 0:
         return None

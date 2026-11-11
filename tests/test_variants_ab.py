@@ -99,7 +99,7 @@ def fake_runner(monkeypatch):
 
 
 def test_shared_endpoint_variants_refused_without_choice(fake_runner, tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="--variant"):
+    with pytest.raises(runner_mod.RunRefused, match="--variant"):
         runner_mod.run_spec(_ab(), tmp_path)
     assert fake_runner.calls == []
 
@@ -132,5 +132,8 @@ def test_apply_variant_endpoint_override() -> None:
     spec = _ab(a={"endpoint": {"base_url": "http://127.0.0.1:8201/v1"}})
     one = apply_variant(spec, spec.variants[0])
     assert one.endpoint.base_url == "http://127.0.0.1:8201/v1"
-    assert one.endpoint.metrics_url == spec.endpoint.metrics_url
+    # metrics/health follow the variant's own base_url, not the parent's port.
+    assert one.endpoint.metrics_url == "http://127.0.0.1:8201/metrics"
+    assert one.endpoint.health_url == "http://127.0.0.1:8201/health"
+    assert spec.endpoint.health_url == "http://127.0.0.1:8000/health"
     assert one.variants == []

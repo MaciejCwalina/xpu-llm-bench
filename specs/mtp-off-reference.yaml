@@ -8,8 +8,6 @@ profile: quick
 kind: run
 endpoint:
   base_url: http://127.0.0.1:8102/v1  # TODO (never a protected production port)
-  metrics_url: http://127.0.0.1:8102/metrics
-  health_url: http://127.0.0.1:8102/health
   model: TODO-served-model-name
 server:
   container_name: vllm-bench-mtp-off
@@ -20,10 +18,6 @@ server:
     capture_sizes: [1, 2, 4, 8]
   speculative:
     method: none
-hardware:
-  mem_available_floor_gib: 2
-safety:
-  hold_name: xpu-llm-bench-mtp-off
 ladder:
   # Progressive: session 1 grows through every context rung, then users join.
   shape: session1_then_join

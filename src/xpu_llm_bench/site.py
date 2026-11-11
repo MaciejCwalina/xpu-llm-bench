@@ -24,6 +24,7 @@ import os
 import re
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field
@@ -56,6 +57,15 @@ class SiteConfig(BaseModel):
     hold_command: str | None = None
     # Operator quiet-hold file (read only). An active quiet hold blocks runs.
     quiet_hold_file: str | None = None
+    # Display timezone for the *_local timestamps (IANA name, e.g. Europe/Berlin).
+    timezone: str | None = None
+    # Bench-host facts used as defaults for a spec's `hardware:` block
+    # (gpu_model, gpu_count, gpu_mem_gib, tensor_parallel, host_ram_gib,
+    # mem_available_floor_gib). Spec values win.
+    hardware: dict[str, Any] = Field(default_factory=dict)
+    # Planner defaults for this host (e.g. host_bytes_per_token,
+    # assumed_weight_gib). Spec values win.
+    planner: dict[str, Any] = Field(default_factory=dict)
     source: str | None = None
 
 

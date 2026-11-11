@@ -86,14 +86,50 @@
           "title": "Eager Fallback",
           "type": "boolean"
         },
+        "graphs_basis": {
+          "default": "unknown",
+          "enum": [
+            "boot_log",
+            "unknown"
+          ],
+          "title": "Graphs Basis",
+          "type": "string"
+        },
+        "graphs_declared": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Graphs Declared"
+        },
         "graphs_on": {
-          "default": true,
-          "title": "Graphs On",
-          "type": "boolean"
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Graphs On"
         },
         "mode": {
-          "title": "Mode",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mode"
         },
         "per_gpu": {
           "default": false,
@@ -101,9 +137,6 @@
           "type": "boolean"
         }
       },
-      "required": [
-        "mode"
-      ],
       "title": "GraphSnapshot",
       "type": "object"
     },
@@ -122,12 +155,19 @@
           "title": "Driver"
         },
         "gpu_count": {
-          "default": 2,
-          "title": "Gpu Count",
-          "type": "integer"
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu Count"
         },
         "gpu_model": {
-          "default": "Intel Arc Pro B60",
+          "default": "unspecified",
           "title": "Gpu Model",
           "type": "string"
         },
@@ -166,9 +206,16 @@
           "title": "Oneapi"
         },
         "tensor_parallel": {
-          "default": 2,
-          "title": "Tensor Parallel",
-          "type": "integer"
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tensor Parallel"
         }
       },
       "title": "HardwareSnapshot",
@@ -370,12 +417,7 @@
           ],
           "default": null
         },
-        "fingerprint": {
-          "additionalProperties": true,
-          "title": "Fingerprint",
-          "type": "object"
-        },
-        "finished_et": {
+        "display_timezone": {
           "anyOf": [
             {
               "type": "string"
@@ -385,7 +427,24 @@
             }
           ],
           "default": null,
-          "title": "Finished Et"
+          "title": "Display Timezone"
+        },
+        "fingerprint": {
+          "additionalProperties": true,
+          "title": "Fingerprint",
+          "type": "object"
+        },
+        "finished_local": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Finished Local"
         },
         "finished_utc": {
           "anyOf": [
@@ -586,8 +645,8 @@
           ],
           "default": null
         },
-        "started_et": {
-          "title": "Started Et",
+        "started_local": {
+          "title": "Started Local",
           "type": "string"
         },
         "started_utc": {
@@ -617,7 +676,7 @@
         "spec_name",
         "profile",
         "started_utc",
-        "started_et",
+        "started_local",
         "hardware"
       ],
       "title": "RunManifest",
@@ -849,7 +908,7 @@
           "default": null,
           "title": "Exit Reason"
         },
-        "finished_et": {
+        "finished_local": {
           "anyOf": [
             {
               "type": "string"
@@ -859,7 +918,7 @@
             }
           ],
           "default": null,
-          "title": "Finished Et"
+          "title": "Finished Local"
         },
         "finished_utc": {
           "anyOf": [
@@ -1189,7 +1248,7 @@
           "title": "Session Seeds",
           "type": "array"
         },
-        "started_et": {
+        "started_local": {
           "anyOf": [
             {
               "type": "string"
@@ -1199,7 +1258,7 @@
             }
           ],
           "default": null,
-          "title": "Started Et"
+          "title": "Started Local"
         },
         "started_utc": {
           "anyOf": [
@@ -1404,8 +1463,16 @@
           "title": "Dflash K"
         },
         "method": {
-          "title": "Method",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Method"
         },
         "num_speculative_tokens": {
           "anyOf": [
@@ -1420,9 +1487,6 @@
           "title": "Num Speculative Tokens"
         }
       },
-      "required": [
-        "method"
-      ],
       "title": "SpecDecodeSnapshot",
       "type": "object"
     }

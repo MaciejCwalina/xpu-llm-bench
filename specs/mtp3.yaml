@@ -7,8 +7,6 @@ profile: quick
 kind: run
 endpoint:
   base_url: http://127.0.0.1:8102/v1  # TODO: confirm test-container port (never a protected production port)
-  metrics_url: http://127.0.0.1:8102/metrics
-  health_url: http://127.0.0.1:8102/health
   api_key_env: OPENAI_API_KEY
   model: TODO-served-model-name
 server:
@@ -26,13 +24,8 @@ server:
     method: mtp
     num_speculative_tokens: 3
   max_num_seqs: 8
-hardware:
-  mem_available_floor_gib: 2
 access:
   mode: local  # TODO
-safety:
-  hold_name: xpu-llm-bench-mtp3
-  hold_reason: xpu-llm-bench MTP-3 ladder
 ladder:
   # Progressive: session 1 grows through every context rung, then users join.
   shape: session1_then_join

@@ -59,12 +59,19 @@ from `planner.assumed_*` (not measured), and a GPU / host-RAM feasibility
 check, and exits 1 when the plan cannot fit:
 - GPU: weights + KV(peak live tokens) + device overhead against
   `gpu_count × gpu_mem_gib` (FAIL above 95%, WARN above 85%).
-- Host: server-process RAM plus any host-resident KV share
-  (`planner.host_kv_fraction`) against `host_ram_gib` minus the
-  MemAvailable floor (FAIL if over, WARN within 2 GiB). The process RAM is
-  measured RSS when available (`bench plan --measured results.jsonl`, and a
-  live run re-checks with the server's RSS at preflight), otherwise the
-  `planner.assumed_host_process_gib` ESTIMATE.
+- Host: RAM growth over the run, peak live tokens ×
+  `planner.host_bytes_per_token` (ESTIMATE, default 64 KiB) plus any
+  host-resident KV share (`planner.host_kv_fraction`), against **live
+  MemAvailable minus the floor** (`hardware.mem_available_floor_gib`,
+  default 2 GiB; both settable in the site config). MemAvailable already
+  counts the booted server and every other process on the host. FAIL if
+  over, WARN within `planner.host_tight_gib`. The reading comes from
+  `bench plan --mem-available GIB`, `--measured results.jsonl` (baseline
+  MemAvailable of an earlier run), or `/proc/meminfo` when `access.mode:
+  local`; a live run re-checks at preflight. With no reading the host check
+  is UNVERIFIED (a warning), never OK.
+- GPU facts (`gpu_count`, `gpu_mem_gib`) come from the spec or the site
+  config `hardware:` block; when unset the GPU check is skipped with a warning.
 
 **Resume.** After each rung the runner saves `manifest.json` (with
 `completed_rung_ids`) and `sessions.json` (a compact record of every
@@ -144,7 +151,7 @@ first). S_i = its verify steps. E = ΣE_i, S = ΣS_i.
 | `steps_s_total`, `decode_tok_s_total` | Σ over sessions |
 | `tokens_per_step` | E / S. Identity: tok/s = steps/s × tokens_per_step |
 | `accepted_drafts_per_step` | E/S − 1 (0..k) |
-| **`hit_rate` (true hit rate)** | **(E − S) / (k × S)**: the fraction of proposed draft slots that became delivered tokens. It never reads the accepted-tokens counter, which reported 107% on production (Accepted 61 > Drafted 57, 2026-11-08). |
+| **`hit_rate` (true hit rate)** | **(E − S) / (k × S)**: the fraction of proposed draft slots that became delivered tokens. It never reads the accepted-tokens counter, which some builds over-report (accepted > drafted, i.e. above 100%). |
 | `acceptance_rate_vllm` | Δaccepted / Δdraft_tokens, kept for continuity only |
 | `verify_steps`, `verify_steps_stream`, `verify_steps_server`, `tokens_delivered` | the raw counts behind the above |
 | `prefill_tok_s` | Σ(new prompt tokens) / Σ(TTFT) over this rung's growth requests (sequential). New = `prompt_tokens − cached_tokens` (needs `--enable-prompt-tokens-details`), else Δprefix queries − Δprefix hits |

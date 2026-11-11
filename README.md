@@ -1,6 +1,6 @@
 # xpu-llm-bench
 
-Consistent, comparable benchmark runs for LLM serving on an Intel XPU bench host (written against 2× Intel Arc Pro B60, vLLM 0.30 XPU, MTP / QSA / K8V4 / DFlash2).
+Consistent, comparable benchmark runs for LLM serving on an Intel XPU bench host. It was written against 2× Intel Arc Pro B60 with a vLLM XPU fork (MTP / QSA / K8V4 / DFlash2), but works with any OpenAI-compatible vLLM server: start from [`specs/generic-vllm.yaml`](specs/generic-vllm.yaml).
 
 Same methodology, same metrics, same report columns — so a run from Tuesday can be put next to a run from Friday without guessing what was measured.
 
@@ -21,18 +21,46 @@ test container; the harness measures it and checks it is what the spec says.
    `bench run` refuses to start without one unless you pass `--no-site-config`.
 
 3. **Boot a test container yourself**, on a port that is not a production
-   port, for example:
+   port. An **example** for an Intel XPU host (every image, path, name and
+   value is a placeholder; the `K8V4_QSA` env var and the speculative config
+   only apply to a vLLM fork that has them, so drop them for stock vLLM):
 
    ```bash
-   docker run -d --name vllm-bench-qsa ... <image> vllm serve <model> --port 8102 ...
+   #!/usr/bin/env bash
+   # Example only: adjust image, paths, model, TP size and port to your host.
+   set -euo pipefail
+   IMAGE="<vllm-xpu-image>:<tag>"            # your vLLM XPU image
+   MODEL_DIR="/path/to/models/<model>"        # target model on the host
+   DRAFT_DIR="/path/to/models/<drafter>"      # MTP / draft model, if any
+   PORT=8102                                  # NOT a production port
+
+   docker run -d --name vllm-bench-qsa \
+     --device /dev/dri --group-add render \
+     --ipc=host --shm-size 16g \
+     -v "$MODEL_DIR":/models/target:ro \
+     -v "$DRAFT_DIR":/models/draft:ro \
+     -p "$PORT":"$PORT" \
+     -e K8V4_QSA=1 \
+     "$IMAGE" \
+     vllm serve /models/target \
+       --served-model-name my-model \
+       --tensor-parallel-size 2 \
+       --kv-cache-dtype <kv-format> \
+       --speculative-config '{"method": "mtp", "model": "/models/draft", "num_speculative_tokens": 6}' \
+       --max-num-seqs 8 \
+       --host 0.0.0.0 --port "$PORT"
    ```
+
+   Then put the same values in the spec (`server.env`, `server.launch_args`,
+   `server.image`) so preflight can check the container matches.
 
    Never point the harness at a production container or port; it refuses
    protected names and ports, but it is your container to launch.
 
 4. **Point a spec at it.** Copy a spec from `specs/` and set:
-   - `endpoint.base_url` / `metrics_url` / `health_url` to the container's port,
-     and `endpoint.model` to the served model name;
+   - `endpoint.base_url` to the container's port (`metrics_url` / `health_url`
+     default to the same host and port), and `endpoint.model` to the served
+     model name;
    - `server.container_name` to the container's name (it must exist and be
      running: preflight runs `docker inspect` on it);
    - `server.image`, `server.env`, `server.launch_args` to what you launched,
@@ -51,6 +79,7 @@ test container; the harness measures it and checks it is what the spec says.
 
    ```bash
    bench plan my-spec.yaml               # order, time, GPU/RAM feasibility (exit 1 if it cannot fit)
+   bench plan my-spec.yaml --mem-available 20   # host RAM check against MemAvailable (GiB) read on the bench host
    bench run my-spec.yaml --dry-run      # plan + the exact safety commands; writes only <out>/<spec>/dry-run/
    bench run my-spec.yaml --output-dir results
    bench report results/<spec-name>      # markdown on stdout
@@ -66,8 +95,10 @@ unless you choose one of:
   next variant with its own container;
 - `--pause-between-variants`: the runner stops before each variant and tells
   you which container (name, env, args) to boot, then waits for Enter;
-- a per-variant `endpoint:` (`base_url`, `metrics_url`, `health_url`) so
+- a per-variant `endpoint:` (`base_url`; metrics and health follow it) so
   both containers can be up at once on different ports.
+
+Without one of these, `bench run` refuses with exit 3.
 
 Each variant's container is verified against that variant's `env` /
 `launch_args` / `image`; a container that does not match is `NOT_AS_LABELED`.
@@ -91,8 +122,11 @@ searched in this order (the current directory is **not** searched):
 | `protected_containers` | yes | Exact names of every production container the runner must never touch. |
 | `protected_patterns` | no | Case-insensitive regexes for other protected services (gateways, git hosting, CI). |
 | `forbidden_ports` | yes | Host ports of every production endpoint; endpoints and containers on them are refused. |
-| `hold_command` | no | Path of the `bench-hold` CLI on the bench host (default: `bench-hold` on PATH). |
+| `hold_command` | no | Path of a `bench-hold` style lock CLI on the bench host. Unset: runs take no hold (with a warning). |
 | `quiet_hold_file` | no | Operator quiet-hold file (read only); an active quiet hold blocks a run. |
+| `timezone` | no | IANA zone for the `*_local` timestamps (default: `$XPU_BENCH_TZ`, else system local). |
+| `hardware` | no | Host facts specs do not set: `gpu_model`, `gpu_count`, `gpu_mem_gib`, `tensor_parallel`, `mem_available_floor_gib` (default 2). |
+| `planner` | no | Planner estimates, e.g. `host_bytes_per_token` (host RAM growth per live token). |
 
 Any value still containing `<...>`, `TODO`, `example` or `changeme` is
 rejected, as is an empty `host`, `protected_containers` or `forbidden_ports`.
@@ -128,7 +162,8 @@ bench report results/my-qsa-full-fix
 bench compare results/qsa-vs-dense__dense/results.jsonl results/qsa-vs-dense__qsa/results.jsonl
 
 # Older rung JSONL (scaffold rows or speed-fix ladder-rungs.jsonl):
-bench import-legacy old.jsonl results/imported.jsonl --prompt-type code_edits
+# --attention-path records what the old run used as DECLARED, not proven:
+bench import-legacy old.jsonl results/imported.jsonl --prompt-type code_edits --attention-path qsa
 ```
 
 Tests and lint (no GPUs; a mock OpenAI server is used):
@@ -168,6 +203,7 @@ There are three prompt types (code edit, writing, chat) and two load levels (all
 
 | Spec | Role |
 |---|---|
+| [`specs/generic-vllm.yaml`](specs/generic-vllm.yaml) | Any vLLM server: quick progressive ladder, nothing fork-specific declared |
 | [`specs/prod-dense-baseline.yaml`](specs/prod-dense-baseline.yaml) | Dense baseline, MTP-6, full matrix |
 | [`specs/qsa-full-fix-mtp6.yaml`](specs/qsa-full-fix-mtp6.yaml) | QSA + current full-fix set, MTP-6 |
 | [`specs/qsa-vs-dense.yaml`](specs/qsa-vs-dense.yaml) | Prioritized A/B: `K8V4_QSA=1` vs `0` |
@@ -177,16 +213,16 @@ There are three prompt types (code edit, writing, chat) and two load levels (all
 | [`specs/mtp-off-reference.yaml`](specs/mtp-off-reference.yaml) | Spec decode off: greedy reference for the MTP on/off check |
 | [`specs/one-fix-at-a-time.yaml`](specs/one-fix-at-a-time.yaml) | Template for a single-fix A/B |
 
-Unknown real values (image digests, served model name, launch args, some env flags, how the runner reaches the bench host) are marked `TODO` in those files. A live run refuses to start until each is set (or set to `null`); `--dry-run` lists them as warnings.
+The other specs are reference configs for one vLLM XPU fork (QSA / K8V4 / MTP / DFlash env flags and graph settings); copy and adapt them. Unknown real values (image digests, served model name, launch args, some env flags, how the runner reaches the bench host) are marked `TODO` in those files. A live run refuses to start until each is set (or set to `null`); `--dry-run` lists them as warnings.
 
 ## Safety
 
 These rules are enforced in code, and the tests check them:
 - Refuses any endpoint on a protected production port and any protected production container or service, plus CI-runner containers. The real names and ports come from an untracked site config (`bench-site.local.yaml`, `~/.config/xpu-llm-bench/site.yaml`, or `$XPU_BENCH_SITE`; see [`bench-site.example.yaml`](bench-site.example.yaml)). Site values only add protection; the built-in neutral defaults (`vllm-production`, port 8001) always apply. `$BENCH_HOST` can name the host for SSH access.
 - Never starts, stops or restarts a container.
-- `bench-hold`: checks `status` first and **refuses if anyone else holds it**, because `acquire` silently overwrites. Also refuses an active operator quiet hold (optional file, from site config). It then acquires, confirms, renews while it still owns the hold, and releases only its own hold.
-- Preflight stops (exit 3, manifest `status: refused`) on: no site config, `TODO`/`<...>` spec values, a missing or stopped test container, a planner GPU/RAM failure (using the server's measured RSS), or a bench-hold held by someone else.
-- Aborts at a 2 GiB `MemAvailable` floor (`--resume` continues).
+- `bench-hold` (optional, when `hold_command` is set): checks `status` first and **refuses if anyone else holds it**, because `acquire` silently overwrites. Also refuses an active operator quiet hold (optional file, from site config). It then acquires under a per-run name (the run id, unless `safety.hold_name` is set), confirms, renews while it still owns the hold, and releases only its own hold. Without a `hold_command` the quiet hold is still honored.
+- Preflight stops (exit 3, manifest `status: refused`) on: no site config, `TODO`/`<...>` spec values, a missing or stopped test container, a planner GPU/RAM failure (host RAM against live `MemAvailable` minus the floor), a variant A/B that would share one endpoint, or a bench-hold held by someone else.
+- Aborts at a `MemAvailable` floor, 2 GiB by default (`hardware.mem_available_floor_gib`; `--resume` continues).
 - Never runs `xpu-smi`, not even discovery.
 - API keys come from the environment only.
 

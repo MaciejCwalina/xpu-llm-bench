@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import jsonschema
@@ -21,9 +22,9 @@ def test_rung_and_manifest_match_schema() -> None:
         prompt_type="code_edits",
         load_mode="closed_all_decoding",
         started_utc=utc,
-        started_et=et,
+        started_local=et,
         finished_utc=utc,
-        finished_et=et,
+        finished_local=et,
     )
     jsonschema.validate(row.model_dump(), SCHEMA)
     man = RunManifest(
@@ -31,17 +32,19 @@ def test_rung_and_manifest_match_schema() -> None:
         spec_name="s",
         profile="quick",
         started_utc=utc,
-        started_et=et,
+        started_local=et,
         hardware=HardwareSnapshot(),
     )
     jsonschema.validate(man.model_dump(), SCHEMA)
 
 
-def test_stamps_are_offset_aware() -> None:
-    utc, et = stamp_pair()
+def test_stamps_are_offset_aware(monkeypatch) -> None:
+    monkeypatch.setenv("XPU_BENCH_TZ", "Asia/Kolkata")
+    utc, local = stamp_pair()
     assert utc.endswith("+00:00") or utc.endswith("Z") or "+00:00" in utc or utc.endswith("+0000")
-    # America/New_York is -05:00 or -04:00
-    assert "-05:00" in et or "-04:00" in et
+    assert local.endswith("+05:30")
+    monkeypatch.delenv("XPU_BENCH_TZ")
+    assert re.search(r"[+-]\d\d:\d\d$", stamp_pair()[1])  # system local, still offset-aware
 
 
 def test_committed_schema_matches_models() -> None:

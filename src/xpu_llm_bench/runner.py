@@ -31,7 +31,7 @@ from xpu_llm_bench.client import OpenAICompatClient, StreamResult
 from xpu_llm_bench.container import ContainerAdapter
 from xpu_llm_bench.fingerprint import Fingerprint, collect_fingerprint, verify_expected
 from xpu_llm_bench.gpu_mem import collect_gpu_mem
-from xpu_llm_bench.hold import BenchHold
+from xpu_llm_bench.hold import BenchHold, quiet_hold_active
 from xpu_llm_bench.hostexec import HostExec
 from xpu_llm_bench.metrics import (
     ChunkStats,
@@ -72,6 +72,7 @@ from xpu_llm_bench.results import (
     RungResult,
     RunManifest,
     SpecDecodeSnapshot,
+    local_tz_name,
     stamp_pair,
     write_jsonl_row,
 )
@@ -382,6 +383,7 @@ class Runner:
         self.no_site_config = no_site_config
         self.require_container = require_container
         self.launch_mismatches: list[str] = []
+        self._run_id: str | None = None
         self.preflight_warnings: list[str] = []
         self.client = client or OpenAICompatClient(
             spec.endpoint.base_url,
@@ -390,19 +392,22 @@ class Runner:
             timeout_s=spec.endpoint.timeout_s,
         )
         self.exec = host_exec or _host_exec(spec)
-        if hold is None:
+        if hold is None and spec.safety.hold_command:
             cmd = spec.safety.hold_command
             if spec.access.mode == "ssh" and cmd.startswith("~/"):
                 cmd = cmd[2:]  # ssh runs in $HOME; avoid expanding ~ on this machine
             hold = BenchHold(
                 cmd,
-                name=spec.safety.hold_name,
+                # Placeholder until run(): replaced by "<run id>" unless the spec names it.
+                name=spec.safety.hold_name or f"xpu-llm-bench-{spec.name}",
                 dry_run=dry_run,
                 runner=(lambda c, **kw: __import__("subprocess").run(self.exec.argv(c), **kw))
                 if spec.access.mode == "ssh"
                 else None,
             )
-        self.hold = hold
+        # None: no bench-hold coordination configured (safety.hold_command / site config).
+        self.hold: BenchHold | None = hold
+        self._hold_auto_name = hold is not None and spec.safety.hold_name is None and self._owns_hold(hold)
         self.containers = containers or ContainerAdapter(allowed=spec.safety.allowed_containers, dry_run=dry_run)
         self.ram_source = ram_source or _ram_source(spec)
         self.sleep = sleep
@@ -422,6 +427,13 @@ class Runner:
         self.diverged: dict[tuple[str, str, int], bool] = {}
         self.corpus_text: dict[str, str | None] = {}
         self.corpus_manifest: dict[str, list[dict]] = {}
+
+    def _owns_hold(self, hold: BenchHold) -> bool:
+        return hold.name == f"xpu-llm-bench-{self.spec.name}"
+
+    @property
+    def hold_reason(self) -> str:
+        return self.spec.safety.hold_reason or f"xpu-llm-bench {self.spec.name} run {self._run_id or '?'}"
 
     # -- I/O ------------------------------------------------------------------
     def _metrics_text(self) -> str:
@@ -515,7 +527,8 @@ class Runner:
             spec_name=self.spec.name,
             profile=self.spec.profile,
             started_utc=utc,
-            started_et=et,
+            started_local=et,
+            display_timezone=local_tz_name(),
             image=self.spec.server.image,
             image_digest=self.spec.server.image_digest,
             server_source_commit=self.spec.server.source_commit,
@@ -547,7 +560,11 @@ class Runner:
                 mode=self.spec.server.graph.mode,
                 per_gpu=self.spec.server.graph.per_gpu,
                 capture_sizes=list(self.spec.server.graph.capture_sizes),
-                graphs_on=self.spec.server.graph.mode != "EAGER",
+                # Evidence only: set from the boot log at preflight, else unknown.
+                graphs_on=None,
+                graphs_basis="unknown",
+                graphs_declared=(None if self.spec.server.graph.mode is None
+                                 else self.spec.server.graph.mode != "EAGER"),
                 eager_fallback=False,
             ),
             speculative=SpecDecodeSnapshot(
@@ -724,7 +741,7 @@ class Runner:
                 flags.append("NOT_AS_LABELED")
             if boot.kv_dtype and self.spec.server.kv_format and boot.kv_dtype != self.spec.server.kv_format:
                 flags.append("NOT_AS_LABELED")
-            if self.spec.server.graph.mode != "EAGER" and boot.graphs_on is False:
+            if self.spec.server.graph.mode not in (None, "EAGER") and boot.graphs_on is False:
                 flags.append("NOT_AS_LABELED")
             if boot.graphs_on is False:
                 flags.append("GRAPH_MISS")
@@ -767,7 +784,7 @@ class Runner:
             boot_started_at=self.fp.started_at if self.fp else None,
             attention_boot=self.boot.attention_boot if self.boot else None,
             started_utc=utc0,
-            started_et=et0,
+            started_local=et0,
         )
         if self.dry_run:
             for sid in rung.grow_sessions:  # no prompt text is generated or stored
@@ -780,7 +797,7 @@ class Runner:
                 reason="dry-run",
                 flags=["DRY_RUN"],
                 finished_utc=utc1,
-                finished_et=et1,
+                finished_local=et1,
             )
 
         # Prefill / growth (joiners one at a time). Outside the measured window.
@@ -997,7 +1014,7 @@ class Runner:
             other_vllm_stacks=sorted(samples.other_stacks),
             attention_path=attention,  # type: ignore[arg-type]
             attention_evidence=(runtime.evidence or (self.boot.evidence if self.boot else []))[:12],
-            graphs_on=self.boot.graphs_on if self.boot and self.boot.graphs_on is not None else self.spec.server.graph.mode != "EAGER",
+            graphs_on=self.boot.graphs_on if self.boot else None,
             eager_fallback=bool(runtime.skip_widths and self.spec.server.graph.eager_fallback_when_unmatched),
             exit_reason=exit_reason,
             flags=sorted(set(flags)),
@@ -1007,7 +1024,7 @@ class Runner:
             errors=[],
             timeouts=0,
             finished_utc=utc1,
-            finished_et=et1,
+            finished_local=et1,
         )
 
     def _failed_row(
@@ -1046,19 +1063,22 @@ class Runner:
             exit_reason=flag,
             flags=[flag],
             finished_utc=utc1,
-            finished_et=et1,
+            finished_local=et1,
         )
 
     # -- preflight ------------------------------------------------------------
     def _would_run(self) -> list[str]:
-        cmd, name = self.hold.command, self.hold.name
-        lines = [
-            f"{cmd} status",
-            f"{cmd} acquire {self.spec.safety.hold_minutes} {self.spec.safety.hold_reason!r} --by {name}",
-            f"{cmd} status",
-            "...",
-            f"{cmd} release  (only if status still shows by={name})",
-        ]
+        if self.hold is None:
+            lines = ["(no bench-hold: safety.hold_command is not set, so no host-wide hold is taken)"]
+        else:
+            cmd, name = self.hold.command, self.hold.name
+            lines = [
+                f"{cmd} status",
+                f"{cmd} acquire {self.spec.safety.hold_minutes} {self.hold_reason!r} --by {name}",
+                f"{cmd} status",
+                "...",
+                f"{cmd} release  (only if status still shows by={name})",
+            ]
         if self.spec.safety.quiet_hold_file:
             lines.insert(0, f"read {self.spec.safety.quiet_hold_file}  (an active quiet hold blocks the run)")
         if self.spec.server.container_name:
@@ -1135,21 +1155,26 @@ class Runner:
                 )
         else:
             manifest.launch_check = {"checked": False, "reason": "no container fingerprint"}
-        # Feasibility with measured server RSS when available.
-        measured = None
+        # Feasibility against live MemAvailable on the bench host (the server
+        # is booted, so this already counts it and every other process).
         try:
-            snap = self._procs()
-            rss = sum(int(v) for v in (getattr(snap, "ours", None) or {}).values() if v)
-            measured = rss / (1024 * 1024) if rss else None
+            mem_now = self.ram_source.read_kib() / (1024 * 1024)
         except Exception:  # noqa: BLE001
-            measured = None
-        feas = feasibility(self.spec, rungs, measured)
+            mem_now = None
+        feas = feasibility(self.spec, rungs, mem_now, "live")
         manifest.launch_check["feasibility"] = {
             "gpu": feas.gpu_status, "host": feas.host_status, "host_basis": feas.host_basis,
-            "host_need_gib": round(feas.host_need_gib, 2), "gpu_need_gib": round(feas.estimated_total_gib, 2),
+            "mem_available_gib": round(mem_now, 2) if mem_now is not None else None,
+            "host_growth_gib": round(feas.host_need_gib, 2), "gpu_need_gib": round(feas.estimated_total_gib, 2),
         }
+        warnings.extend(n for n in feas.notes if n.startswith("WARN"))
         if not feas.ok:
             problems.extend(feas.failures)
+        if self.hold is None:
+            warnings.append(
+                "WARN no safety.hold_command configured (site or spec): running without a bench lock, "
+                "so nothing stops another job from sharing the GPUs"
+            )
         self.preflight_warnings = warnings
         if problems:
             raise RunRefused("\n".join(problems), manifest)
@@ -1159,14 +1184,19 @@ class Runner:
             self.boot = None
         if self.boot:
             manifest.boot = self.boot.summary()
+            if manifest.graph is not None and self.boot.graphs_on is not None:
+                manifest.graph.graphs_on = self.boot.graphs_on
+                manifest.graph.graphs_basis = "boot_log"
             manifest.attention.actual = self.boot.attention_boot  # type: ignore[assignment]
             manifest.attention.evidence_lines = self.boot.evidence[:20]
         manifest.host = self._host()
+        if manifest.hardware.host_ram_gib is None and manifest.host.get("host_ram_gib"):
+            manifest.hardware.host_ram_gib = manifest.host["host_ram_gib"]  # measured MemTotal
 
     def _refuse(self, manifest: RunManifest, exc: Exception) -> RunRefused:
         manifest.status = "refused"
         manifest.abort_reason = str(exc)
-        manifest.finished_utc, manifest.finished_et = stamp_pair()
+        manifest.finished_utc, manifest.finished_local = stamp_pair()
         self._write_manifest(manifest)
         return RunRefused(str(exc), manifest)
 
@@ -1191,6 +1221,10 @@ class Runner:
             for extra in ("sessions.json", "greedy_outputs.jsonl", "logprob_scores.jsonl"):
                 (self.output_dir / extra).unlink(missing_ok=True)
         run_id = manifest.run_id
+        self._run_id = run_id
+        if self.hold is not None and self._hold_auto_name:
+            # Unique per run (a resume keeps its run id, so its hold stays "ours").
+            self.hold.name = run_id
 
         # Safety and identity before anything touches the server.
         try:
@@ -1208,15 +1242,28 @@ class Runner:
         except RamFloorError as exc:
             manifest.status = "aborted"
             manifest.abort_reason = f"RAM_FLOOR before start: {exc}"
-            manifest.finished_utc, manifest.finished_et = stamp_pair()
+            manifest.finished_utc, manifest.finished_local = stamp_pair()
             self._write_manifest(manifest)
             raise
 
-        if not self.dry_run:
+        if not self.dry_run and self.hold is None:
+            try:
+                quiet = quiet_hold_active(
+                    self.spec.safety.quiet_hold_file,
+                    read_file=self._read_remote if self.spec.access.mode == "ssh" else None,
+                )
+            except SafetyError as exc:
+                raise self._refuse(manifest, exc) from None
+            if quiet:
+                raise self._refuse(manifest, SafetyError(f"Refusing to start: {quiet}"))
+            manifest.hold = {"skipped": "no safety.hold_command configured; no bench-hold taken"}
+            self._write_manifest(manifest)
+            watcher.start()
+        elif not self.dry_run:
             try:
                 st = self.hold.guard_and_acquire(
                     self.spec.safety.hold_minutes,
-                    self.spec.safety.hold_reason,
+                    self.hold_reason,
                     quiet_hold_file=self.spec.safety.quiet_hold_file,
                     read_file=self._read_remote if self.spec.access.mode == "ssh" else None,
                 )
@@ -1273,10 +1320,10 @@ class Runner:
                     if not same_boot:
                         extra_flags.append("RESUMED_REFILL")
                     refill_pending = False
-                if not self.dry_run and time.time() - last_renew > max(self.spec.safety.hold_renew_below_min, 1) * 60:
+                if self.hold is not None and not self.dry_run and time.time() - last_renew > max(self.spec.safety.hold_renew_below_min, 1) * 60:
                     st = self.hold.state()
                     if st.active and st.by == self.hold.name:
-                        self.hold.renew(self.spec.safety.hold_minutes, self.spec.safety.hold_reason)
+                        self.hold.renew(self.spec.safety.hold_minutes, self.hold_reason)
                         last_renew = time.time()
                     else:
                         abort_reason = f"bench-hold no longer ours ({st.raw.strip()[:120]}); stopping"
@@ -1292,7 +1339,7 @@ class Runner:
                              prompt_seed=self.spec.prompts.seed, session_seeds=base_seeds,
                              temperature=self.spec.ladder.temperature, k=self.k_declared,
                              build_fingerprint=self.fp.build_fingerprint if self.fp else None,
-                             started_utc=stamp_pair()[0], started_et=stamp_pair()[1]),
+                             started_utc=stamp_pair()[0], started_local=stamp_pair()[1]),
                         rung, local, [str(exc)], timed_out=False, since=time.time(), log_lines=[],
                         ram_floor=True, mem_min=watcher.min_gib(),
                     )
@@ -1318,11 +1365,11 @@ class Runner:
                 self._write_manifest(manifest)
         finally:
             watcher.stop()
-            if not self.dry_run:
+            if not self.dry_run and self.hold is not None:
                 released, note = self.hold.release_if_ours()
                 manifest.hold = {**(manifest.hold or {}), "released": released, "release_note": note}
 
-        manifest.finished_utc, manifest.finished_et = stamp_pair()
+        manifest.finished_utc, manifest.finished_local = stamp_pair()
         if abort_reason:
             manifest.status = "aborted"
             manifest.abort_reason = abort_reason
@@ -1389,7 +1436,7 @@ def run_spec(
         expanded = [apply_variant(spec, v) for v in chosen]
         urls = [e.endpoint.base_url for e in expanded]
         if len(set(urls)) != len(urls):
-            raise ValueError(
+            raise RunRefused(
                 "this spec has variants that share one endpoint, so they would all hit the same container. "
                 "Run one variant at a time with --variant NAME (booting its container first), give each variant "
                 "its own endpoint.base_url, or pass --pause-between-variants."

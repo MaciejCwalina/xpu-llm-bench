@@ -102,6 +102,7 @@ def import_row(
     load_mode: str = "closed_all_decoding",
     correct_k: int | None = None,
     port: int | None = None,
+    attention_path: str | None = None,
 ) -> RungResult:
     label = str(_first(data, "rung_id", "label", "rung") or "legacy")
     prompt_list = data.get("prompt_tokens") if isinstance(data.get("prompt_tokens"), list) else None
@@ -202,6 +203,13 @@ def import_row(
     if errors:
         valid = "invalid"
         reason = "; ".join(errors)
+    attn = _first(data, "attention_path")
+    if attn is None and attention_path:
+        attn = attention_path
+    if attn is not None:
+        # Legacy rows carry no log evidence: the path is declared, not proven.
+        flags.append("ATTENTION_DECLARED")
+        reason += f"; attention_path={attn} declared, not proven by logs"
     utc, et = stamp_pair()
     return RungResult(
         run_id=run_id,
@@ -230,16 +238,16 @@ def import_row(
         kv_cache_usage_pct=kv_pct * 100.0 if kv_pct is not None and kv_pct <= 1.0 else kv_pct,
         mem_available_min_gib=mem_gib,
         preemptions=_as_int(_first(data, "preemptions")),
-        attention_path=str(_first(data, "attention_path") or "unknown"),  # type: ignore[arg-type]
+        attention_path=str(attn or "unknown"),  # type: ignore[arg-type]
         valid=valid,  # type: ignore[arg-type]
         reason=reason,
         errors=errors,
         k=k,
         flags=flags,
         started_utc=utc,
-        started_et=et,
+        started_local=et,
         finished_utc=utc,
-        finished_et=et,
+        finished_local=et,
     )
 
 
@@ -251,6 +259,7 @@ def import_legacy_file(
     prompt_type: str = "unknown",
     correct_k: int | None = None,
     port: int | None = None,
+    attention_path: str | None = None,
 ) -> int:
     count = 0
     dest_path = Path(dest)
@@ -267,6 +276,7 @@ def import_legacy_file(
             prompt_type=prompt_type,
             correct_k=correct_k,
             port=port,
+            attention_path=attention_path,
         )
         write_jsonl_row(dest_path, row)
         count += 1

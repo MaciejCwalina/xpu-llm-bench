@@ -1,0 +1,40 @@
+# Generic starting point: any OpenAI-compatible vLLM server, no fork-specific
+# settings. Copy it, then replace every TODO / <...> value.
+#
+# Nothing here is assumed about the server: KV format, graph mode and
+# speculative decoding are left undeclared, so they are recorded as "unknown"
+# (read from logs where possible) and never flagged NOT_AS_LABELED.
+# Hardware facts (GPU count / memory, tensor parallel) can be set here or in
+# the site config `hardware:` block; unset values skip the GPU fit check with
+# a warning.
+name: generic-vllm
+description: Plain vLLM server, quick progressive ladder, no speculative decoding declared.
+profile: quick
+kind: run
+endpoint:
+  # metrics_url / health_url default to <scheme://host:port>/metrics and /health.
+  base_url: http://127.0.0.1:8000/v1  # TODO: your test container's port (never a production port)
+  api_key_env: OPENAI_API_KEY
+  model: TODO-served-model-name
+server:
+  image: null  # optional: "<image>:<tag>" to check the container's image
+  container_name: TODO-test-container-name
+  manage_container: false
+  attention_requested: auto  # path is classified from logs; "unknown" when no fork log lines match
+  env: {}
+  launch_args: []
+access:
+  mode: local  # or ssh (uses ssh_host from the site config)
+safety:
+  allowed_containers: [TODO-test-container-name]
+prompts:
+  types: [code_edits, long_form, multi_turn_chat]
+ladder:
+  shape: session1_then_join
+  context_rungs_tokens: [8192, 32768]
+  concurrency_steps: [1, 2, 4, 8]
+  load_modes: [closed_all_decoding]
+  output_tokens_per_rung: 128
+  warmup: {tokens: 16, requests: 1}
+  grow_monotonically: true
+  boot_once: true

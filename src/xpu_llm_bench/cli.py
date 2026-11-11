@@ -8,7 +8,13 @@ from pathlib import Path
 
 from xpu_llm_bench import __version__
 from xpu_llm_bench.import_legacy import import_legacy_file
-from xpu_llm_bench.planner import GRID_WARNING, format_plan, make_plan, measured_host_gib_from_rows
+from xpu_llm_bench.planner import (
+    GRID_WARNING,
+    baseline_mem_available_from_rows,
+    format_plan,
+    local_mem_available_gib,
+    make_plan,
+)
 from xpu_llm_bench.report import (
     COLUMNS,
     compare_runs,
@@ -48,7 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--measured",
         type=Path,
         default=None,
-        help="results.jsonl from an earlier run: use its measured server RSS for the host-RAM check",
+        help="results.jsonl from an earlier run on this host: use its measured MemAvailable baseline",
+    )
+    plan.add_argument(
+        "--mem-available",
+        type=float,
+        default=None,
+        metavar="GIB",
+        help="Current MemAvailable on the bench host (GiB) with the test server booted",
     )
     _add_profile(plan)
 
@@ -111,6 +124,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     imp.add_argument("--port", type=int, default=None, help="Server port of the legacy run (a protected production port -> PROTECTED_PORT flag)")
     imp.add_argument("--prompt-type", default="unknown")
+    imp.add_argument(
+        "--attention-path",
+        choices=["qsa", "dense", "fallback", "unknown"],
+        default=None,
+        help="Attention path the legacy run used. Recorded as DECLARED (flag ATTENTION_DECLARED), "
+        "not proven by log evidence",
+    )
     return parser
 
 
@@ -140,10 +160,14 @@ def main(argv: list[str] | None = None) -> int:
 def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.cmd == "plan":
         spec = load_spec(args.spec, profile=args.profile)
-        measured = None
-        if args.measured:
-            measured = measured_host_gib_from_rows(load_run(args.measured))
-        plan = make_plan(spec, measured_host_gib=measured)
+        mem, basis = None, "live"
+        if args.mem_available is not None:
+            mem, basis = args.mem_available, "given"
+        elif args.measured:
+            mem, basis = baseline_mem_available_from_rows(load_run(args.measured)), "measured baseline"
+        elif spec.access.mode == "local":
+            mem = local_mem_available_gib()
+        plan = make_plan(spec, mem_available_gib=mem, basis=basis)
         print(describe_site())
         sys.stdout.write(format_plan(plan))
         return 0 if plan.feasibility.ok else 1
@@ -153,7 +177,8 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         if spec.ladder.shape == "grid":
             print(GRID_WARNING, file=sys.stderr)
         if args.dry_run:
-            sys.stdout.write(format_plan(make_plan(spec)))
+            mem = local_mem_available_gib() if spec.access.mode == "local" else None
+            sys.stdout.write(format_plan(make_plan(spec, mem_available_gib=mem)))
         manifests = run_spec(
             spec,
             args.output_dir,
@@ -225,6 +250,7 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             prompt_type=args.prompt_type,
             correct_k=args.correct_summed_ratio,
             port=args.port,
+            attention_path=args.attention_path,
         )
         print(f"imported {n} rows -> {args.dest}")
         return 0

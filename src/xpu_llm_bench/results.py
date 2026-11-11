@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
-from xpu_llm_bench import USER_TZ, __version__
+from xpu_llm_bench import TZ_ENV, __version__
 
 AttentionPath = Literal["qsa", "dense", "fallback", "mixed", "unknown"]
 Validity = Literal["valid", "invalid", "warning"]
@@ -42,6 +42,7 @@ FLAGS: dict[str, str] = {
     "QUALITY_FAIL": "A quality check failed on this rung (see quality fields).",
     "CONVERTED": "Value converted from a legacy definition (import-legacy).",
     "HIT_RATE_UNKNOWN": "Imported row: no tokens_per_step / drafts to derive the true hit rate; hit_rate left empty (the acceptance counter is never used as hit_rate).",
+    "ATTENTION_DECLARED": "Imported row: attention_path was declared with --attention-path, not proven by log evidence.",
     "DRY_RUN": "Placeholder row from --dry-run.",
 }
 
@@ -50,23 +51,41 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-def et_now(now: datetime | None = None) -> datetime:
+def local_tz_name() -> str:
+    """IANA name of the display timezone, or "system-local"."""
+    import os
+
+    name = os.environ.get(TZ_ENV, "").strip()
+    if name:
+        return name
+    try:
+        from xpu_llm_bench.site import load_site
+
+        site_tz = load_site().timezone
+    except Exception:  # noqa: BLE001
+        site_tz = None
+    return site_tz or "system-local"
+
+
+def local_now(now: datetime | None = None) -> datetime:
     src = now or utc_now()
-    return src.astimezone(ZoneInfo(USER_TZ))
+    name = local_tz_name()
+    if name == "system-local":
+        return src.astimezone()
+    return src.astimezone(ZoneInfo(name))
 
 
 def stamp_pair(now: datetime | None = None) -> tuple[str, str]:
-    """Return (utc_iso, america_new_york_iso) with offsets."""
+    """Return (utc_iso, local_iso), both with explicit offsets."""
     utc = (now or utc_now()).astimezone(UTC)
-    et = et_now(utc)
-    return utc.isoformat(), et.isoformat()
+    return utc.isoformat(), local_now(utc).isoformat()
 
 
 class HardwareSnapshot(BaseModel):
     host: str = "unspecified"
-    gpu_model: str = "Intel Arc Pro B60"
-    gpu_count: int = 2
-    tensor_parallel: int = 2
+    gpu_model: str = "unspecified"
+    gpu_count: int | None = None
+    tensor_parallel: int | None = None
     driver: str | None = None  # TODO: collect if available without xpu-smi
     oneapi: str | None = None  # TODO
     host_ram_gib: float | None = None
@@ -74,15 +93,19 @@ class HardwareSnapshot(BaseModel):
 
 
 class GraphSnapshot(BaseModel):
-    mode: str
+    mode: str | None = None
     per_gpu: bool = False
     capture_sizes: list[int] = Field(default_factory=list)
-    graphs_on: bool = True
+    # From evidence only (the boot log); None = unknown (e.g. a dry run).
+    graphs_on: bool | None = None
+    graphs_basis: Literal["boot_log", "unknown"] = "unknown"
+    # What the spec declared (graph.mode != EAGER); not evidence.
+    graphs_declared: bool | None = None
     eager_fallback: bool = False
 
 
 class SpecDecodeSnapshot(BaseModel):
-    method: str
+    method: str | None = None
     num_speculative_tokens: int | None = None
     dflash_k: int | None = None
 
@@ -205,9 +228,13 @@ class RungResult(BaseModel):
     flags: list[str] = Field(default_factory=list)
     quality: QualityResult = Field(default_factory=QualityResult)
     started_utc: str | None = None
-    started_et: str | None = None
+    started_local: str | None = Field(
+        default=None, validation_alias=AliasChoices("started_local", "started_et")
+    )
     finished_utc: str | None = None
-    finished_et: str | None = None
+    finished_local: str | None = Field(
+        default=None, validation_alias=AliasChoices("finished_local", "finished_et")
+    )
 
     @property
     def comparable_key(self) -> tuple[Any, ...]:
@@ -227,9 +254,14 @@ class RunManifest(BaseModel):
     profile: str
     tool_version: str = __version__
     started_utc: str
-    started_et: str
+    # Same instant in the display timezone (old files used "started_et").
+    started_local: str = Field(validation_alias=AliasChoices("started_local", "started_et"))
     finished_utc: str | None = None
-    finished_et: str | None = None
+    finished_local: str | None = Field(
+        default=None, validation_alias=AliasChoices("finished_local", "finished_et")
+    )
+    # IANA zone of the *_local stamps ("system-local" = the runner's own zone).
+    display_timezone: str | None = None
     # dry_run: a --dry-run manifest (written under <out>/dry-run/); --resume ignores it.
     # refused: preflight or bench-hold refused the run before any rung ran.
     status: Literal["in_progress", "completed", "aborted", "refused", "dry_run"] = "in_progress"

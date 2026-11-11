@@ -79,8 +79,9 @@ def test_compare_keys_on_users_ctx_prompt_type(tmp_path: Path) -> None:
     assert len(pairs) == len(a)
     assert {p.key[:3] for p in pairs} == {(1, 8192, "unknown"), (2, 8192, "unknown"),
                                           (3, 8192, "unknown"), (4, 8192, "unknown")}
-    # Two imported rows are comparable with each other (CONVERTED on both sides).
-    assert all(not p.reasons for p in pairs)
+    # Two imported rows pair up, but the pair is caveated, never a clean A/B.
+    assert all(len(p.reasons) == 1 and "both rows imported" in p.reasons[0] for p in pairs)
+    assert not any("flagged CONVERTED" in r for p in pairs for r in p.reasons)
     text = format_compare(pairs)
     assert "| 4 | 8192 | unknown |" in text
 

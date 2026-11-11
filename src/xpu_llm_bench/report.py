@@ -216,8 +216,12 @@ def non_comparable_reasons(a: RungResult, b: RungResult) -> list[str]:
         drift = max(abs(x - y) / max(x, y, 1) for x, y in zip(a.ctx_tokens, b.ctx_tokens, strict=False))
         if drift > 0.05:
             reasons.append(f"session contexts differ by {drift:.0%}")
-    # Two imported rows share the same legacy conversion; only flag a legacy-vs-new pair.
     both_converted = "CONVERTED" in a.flags and "CONVERTED" in b.flags
+    if both_converted:
+        reasons.append(
+            "both rows imported from legacy files (CONVERTED): definitions, windows and attention "
+            "path are not verified the way live rows are; treat as a caveated, not clean, A/B"
+        )
     for side, row in (("A", a), ("B", b)):
         for flag in row.flags:
             if flag in {"K_UNDECLARED"} or (both_converted and flag == "CONVERTED"):
@@ -353,7 +357,7 @@ def run_report(rows: list[RungResult], manifest: RunManifest | None = None) -> s
             "| --- | --- |",
             f"| spec / profile | {manifest.spec_name} / {manifest.profile} |",
             f"| status | {manifest.status}{' — ' + manifest.abort_reason if manifest.abort_reason else ''} |",
-            f"| started (ET) | {manifest.started_et} |",
+            f"| started ({manifest.display_timezone or 'local'}) | {manifest.started_local} |",
             f"| container | {fp.get('container', '')} {str(fp.get('container_id') or '')[:12]} |",
             f"| image tag / ID | {manifest.image} / {fp.get('image_id') or manifest.image_digest} |",
             f"| build fingerprint | {fp.get('build_fingerprint') or 'n/r'} |",

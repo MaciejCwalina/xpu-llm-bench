@@ -11,8 +11,10 @@ A run writes these files under `--output-dir/<spec-name>/`:
 
 `schemas/result.schema.json` is generated from the Pydantic models in
 `xpu_llm_bench.results` (`python scripts/gen_schema.py`). `tests/test_schema.py`
-fails if it drifts. Every timestamp is recorded twice: UTC and America/New_York,
-both with explicit offsets. Definitions of every metric are in
+fails if it drifts. Every timestamp is recorded twice: UTC (`*_utc`) and the display timezone
+(`*_local`; `$XPU_BENCH_TZ`, else site `timezone`, else system local; named in
+`manifest.display_timezone`), both with explicit offsets. Older files with
+`started_et` / `finished_et` still load. Definitions of every metric are in
 [METHODOLOGY.md](METHODOLOGY.md) §4.
 
 ## Manifest (`RunManifest`)
@@ -28,7 +30,8 @@ both with explicit offsets. Definitions of every metric are in
 | `fingerprint` | `build_fingerprint`, `launch_fingerprint`, image id, per-mount hashes, StartedAt, redacted env |
 | `boot` | Parsed boot evidence (attention_boot, QSA_WRAP / QSA_MEMORY_PLAN / banner, graphs, capture sizes, KV dtype and tokens, speculative config) |
 | `host` | sysfs GPU ids/driver, kernel, oneAPI / level-zero package versions (no xpu-smi) |
-| `hold` | bench-hold status before, our acquire, status after, release |
+| `hold` | bench-hold status before, our acquire, status after, release (`{"skipped": ...}` when no `hold_command` is configured). The default hold name is the run id (`<spec name>-<utc stamp>-…`), so copies of a spec never share a hold. |
+| `graph` | `graphs_declared` (from the spec's graph mode, or null), `graphs_on` (true/false only from boot-log evidence, else null) and `graphs_basis` (`boot_log` / `unknown`). Dry runs never claim graphs on. |
 | `corpus_files` | sha256 of each corpus file when `prompts.corpus_dir` is used |
 | `first_greedy_divergence` | First probe and token where MTP-on output left the reference |
 | `image`, `hardware`, `config`, `attention`, `kv_format`, `graph`, `speculative`, `decode_method` | Spec-declared config, plus the method id `fixed-tokens-chunks-v2` and the formula text |
@@ -86,6 +89,7 @@ Fields on the row that are not in the table: `session_seeds`, `temperature`,
 | `QUALITY_FAIL` | A quality check failed on this rung (see quality fields). |
 | `CONVERTED` | Value converted from a legacy definition (import-legacy). |
 | `DRY_RUN` | Placeholder row from --dry-run. |
+| `ATTENTION_DECLARED` | Imported row: attention_path was declared with --attention-path, not proven by log evidence. |
 | `HIT_RATE_UNKNOWN` | Imported row: no tokens_per_step / drafts to derive the true hit rate; hit_rate left empty (the acceptance counter is never used as hit_rate). |
 
 ## Comparison

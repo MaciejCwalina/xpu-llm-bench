@@ -26,7 +26,27 @@ protected_patterns:
 forbidden_ports:
   - <production-port>
 
-# Path of the bench-hold CLI on the bench host.
-hold_command: bench-hold
+# Optional: path of a `bench-hold` style lock CLI on the bench host
+# (status / acquire / renew / release). Leave null if you have none; runs then
+# go ahead without a hold (bench run prints a warning).
+hold_command: null
 # Optional operator quiet-hold file (read only; an active quiet hold blocks runs).
 quiet_hold_file: null
+
+# Optional: IANA zone for the second, human-readable timestamp in results
+# (started_local / finished_local). Default: $XPU_BENCH_TZ, else system local.
+timezone: null
+
+# Optional: facts about the bench host, used when a spec does not set them.
+# Unset GPU facts skip the planner's GPU fit check with a warning.
+hardware: {}
+#   gpu_model: <gpu-model>
+#   gpu_count: 2
+#   gpu_mem_gib: 24
+#   tensor_parallel: 2
+#   mem_available_floor_gib: 2.0   # abort a run when MemAvailable reaches this
+
+# Optional: planner estimates (see docs/METHODOLOGY.md, "Planner").
+planner: {}
+#   host_bytes_per_token: 65536     # host RAM growth per live token (ESTIMATE)
+#   assumed_weight_gib: 18.0       # model weights per GPU (ESTIMATE)

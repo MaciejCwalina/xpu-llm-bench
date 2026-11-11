@@ -24,7 +24,7 @@ def _w(D, T, A):
 
 
 def test_counter_check_catches_production_107_percent() -> None:
-    # Production log 2026-11-08: Accepted 61 tokens, Drafted 57 tokens (107%).
+    # Seen in a real log: Accepted 61 tokens, Drafted 57 tokens (107%).
     chk = spec_counter_check(_w(D=9.5, T=57, A=61), k=6, delivered=None, verify_steps_stream=None, n_requests=1)
     assert not chk.ok
     assert any("accepted" in p for p in chk.problems)

@@ -146,11 +146,11 @@ def test_greedy_reference_match(mock_server, tmp_path: Path) -> None:
 
 def test_refuses_foreign_hold_before_any_request(mock_server, tmp_path: Path) -> None:
     class P:
-        returncode, stdout, stderr = 0, "active by=speedfix-s5 reason=matrix until=x acquired=y queued=0\n", ""
+        returncode, stdout, stderr = 0, "active by=other-job reason=matrix until=x acquired=y queued=0\n", ""
 
     hold = BenchHold("/x/bench-hold", name="xpu-llm-bench", runner=lambda *a, **k: P())
     spec = _spec(mock_server["base"])
-    with pytest.raises(SafetyError, match="speedfix-s5"):
+    with pytest.raises(SafetyError, match="other-job"):
         _runner(spec, tmp_path / "o", mock_server, tmp_path, hold=hold).run()
     assert mock_server["state"].chat_requests == 0
 
@@ -188,8 +188,8 @@ class Dropping(RamSource):
 
 def test_ram_floor_mid_run_is_a_row_flag_and_resumable(mock_server, tmp_path: Path) -> None:
     spec = _spec(mock_server["base"], hardware={"mem_available_floor_gib": 2.0})
-    # plenty at start, then 1.5 GiB
-    src = Dropping([8 * 1024 * 1024, 1536 * 1024])
+    # plenty at preflight and start, then 1.5 GiB
+    src = Dropping([8 * 1024 * 1024, 8 * 1024 * 1024, 1536 * 1024])
     man = _runner(spec, tmp_path / "o", mock_server, tmp_path, ram_source=src).run()
     assert man.status == "aborted" and man.abort_reason.startswith("RAM_FLOOR")
     rows = read_jsonl(tmp_path / "o" / "results.jsonl")

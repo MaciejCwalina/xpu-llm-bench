@@ -18,7 +18,8 @@ AttentionRequested = Literal["qsa", "dense", "auto"]
 
 
 class GraphSettings(BaseModel):
-    mode: GraphMode = "FULL_DECODE_ONLY"
+    # None: not declared, so the graph mode is recorded from the boot log but not checked.
+    mode: GraphMode | None = None
     per_gpu: bool = False
     capture_sizes: list[int] = Field(default_factory=list)
     eager_fallback_when_unmatched: bool = True
@@ -32,7 +33,9 @@ class SpeculativeSettings(BaseModel):
     drafts) and flags every row ``K_UNDECLARED``.
     """
 
-    method: SpecMethod = "mtp"
+    # None: not declared. k is then derived from the counters (K_UNDECLARED) if
+    # the server reports speculative decoding at all.
+    method: SpecMethod | None = None
     num_speculative_tokens: int | None = None
     dflash_k: int | None = None
 
@@ -57,26 +60,47 @@ class SpeculativeSettings(BaseModel):
 
 
 class HardwareSpec(BaseModel):
+    """Facts about the bench host. Put them in the site config's ``hardware:``
+    block (a spec may override). Unset values are reported as unknown; the
+    planner skips a check it has no numbers for and says so."""
+
     host: str = "unspecified"  # display name; site config `host` overrides
-    gpu_model: str = "Intel Arc Pro B60"
-    gpu_count: int = 2
+    gpu_model: str = "unspecified"
+    gpu_count: int | None = None
     # Device memory per GPU, used by the planner's GPU feasibility check.
-    gpu_mem_gib: float = 24.0
-    tensor_parallel: int = 2
-    host_ram_gib: float = 25.0
+    gpu_mem_gib: float | None = None
+    tensor_parallel: int | None = None
+    # None: read MemTotal from the bench host (live preflight, or `bench plan`
+    # when access.mode is local).
+    host_ram_gib: float | None = None
+    # Abort when MemAvailable on the bench host reaches this. A generic safety
+    # default; raise or lower it for your host.
     mem_available_floor_gib: float = 2.0
 
 
 class EndpointSpec(BaseModel):
     base_url: str = "http://127.0.0.1:8000/v1"
-    metrics_url: str = "http://127.0.0.1:8000/metrics"
-    health_url: str = "http://127.0.0.1:8000/health"
+    # None: derived from base_url's origin (<scheme://host:port>/metrics, /health).
+    metrics_url: str | None = None
+    health_url: str | None = None
     # None: derived from base_url's origin (<scheme://host:port>/tokenize).
     tokenize_url: str | None = None
     # API keys are read from this environment variable only. Never put a key in the spec.
     api_key_env: str = "OPENAI_API_KEY"
     model: str = "TODO-model-served-name"
     timeout_s: float = 600.0
+
+    @model_validator(mode="after")
+    def _derive_urls(self) -> EndpointSpec:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(self.base_url)
+        origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else self.base_url
+        if not self.metrics_url:
+            self.metrics_url = origin + "/metrics"
+        if not self.health_url:
+            self.health_url = origin + "/health"
+        return self
 
 
 class ServerSpec(BaseModel):
@@ -95,7 +119,7 @@ class ServerSpec(BaseModel):
     source_commit: str | None = None
     launch_args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
-    kv_format: str = "int8_k_int4_v"
+    kv_format: str | None = None  # None: not declared, not checked against the boot log
     graph: GraphSettings = Field(default_factory=GraphSettings)
     speculative: SpeculativeSettings = Field(default_factory=SpeculativeSettings)
     attention_requested: AttentionRequested = "auto"
@@ -121,10 +145,16 @@ class AccessSpec(BaseModel):
 
 
 class SafetySpec(BaseModel):
-    hold_command: str = "bench-hold"  # on PATH; site config `hold_command` overrides
-    hold_name: str = "xpu-llm-bench"
+    # bench-hold CLI used to take a host-wide benchmark hold. None (default):
+    # no hold is taken. Set it (usually in the site config) on a shared host.
+    hold_command: str | None = None
+    # None (default): "<spec name>-<run id>", unique per run, so two copies of
+    # a spec never treat each other's hold as their own. A resumed run keeps
+    # its run id and so its hold name.
+    hold_name: str | None = None
     hold_minutes: int = 120
-    hold_reason: str = "xpu-llm-bench ladder"
+    # None (default): "xpu-llm-bench <spec name> run <run id>".
+    hold_reason: str | None = None
     # Renew (re-acquire with the same --by) when less than this many minutes remain.
     hold_renew_below_min: float = 20.0
     # Optional operator quiet-hold file, not shown by `bench-hold status`. It is
@@ -258,10 +288,11 @@ class PlannerAssumptions(BaseModel):
     assumed_weight_gib: float = 18.0
     # Device-side runtime overhead (graphs, activations, allocator slack). ESTIMATE.
     assumed_fixed_overhead_gib: float = 4.0
-    # Host RAM held by the server processes (Python, tokenizer, pinned
-    # buffers). ESTIMATE; replaced by measured RSS when available
-    # (`bench plan --measured results.jsonl`, or live at preflight).
-    assumed_host_process_gib: float = 18.0
+    # Host-RAM growth per live context token once the server is booted
+    # (pinned buffers, prefix-cache bookkeeping, CPU-side metadata). ESTIMATE:
+    # measure it on your stack (MemAvailable drop / live tokens) and set it in
+    # the spec or the site config's `planner:` block.
+    host_bytes_per_token: int = 65536
     # Share of the KV footprint that also lives in host RAM (CPU offload /
     # swap space). 0 for device-only KV.
     host_kv_fraction: float = 0.0
@@ -483,6 +514,12 @@ def apply_site(data: dict) -> dict:
         acc["ssh_host"] = site.ssh_host or os.environ["BENCH_HOST"]
     saf = data.setdefault("safety", {}) or {}
     data["safety"] = saf
+    for key, val in (site.hardware or {}).items():
+        hw.setdefault(key, val)
+    plan = data.setdefault("planner", {}) or {}
+    data["planner"] = plan
+    for key, val in (site.planner or {}).items():
+        plan.setdefault(key, val)
     if "hold_command" not in saf and site.hold_command:
         saf["hold_command"] = site.hold_command
     if "quiet_hold_file" not in saf and site.quiet_hold_file:
@@ -511,9 +548,12 @@ def apply_variant(spec: RunSpec, variant: VariantSpec) -> RunSpec:
     if variant.image is not None:
         data["server"]["image"] = variant.image
     if variant.endpoint is not None:
-        for key, val in variant.endpoint.model_dump().items():
-            if val is not None:
-                data["endpoint"][key] = val
+        given = {k: v for k, v in variant.endpoint.model_dump().items() if v is not None}
+        if "base_url" in given:
+            # Other URLs follow the variant's own base_url unless it names them.
+            for key in ("metrics_url", "health_url", "tokenize_url"):
+                data["endpoint"][key] = None
+        data["endpoint"].update(given)
     data["variants"] = []
     return RunSpec.model_validate(data)
 

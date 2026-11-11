@@ -9,7 +9,7 @@ class P:
         self.returncode, self.stdout, self.stderr = code, out, err
 
 
-ACTIVE_OTHER = "active by=speedfix-s5 reason=speedfix-s5-matrix until=Wed Nov 11 1:27:42 PM EST acquired=Wed Nov 11 9:27:42 AM EST queued=0\n"
+ACTIVE_OTHER = "active by=other-job reason=other-job-matrix until=Wed Nov 11 1:27:42 PM EST acquired=Wed Nov 11 9:27:42 AM EST queued=0\n"
 RELEASED = "released path=/run/user/1000/bench-hold.json queued=0\n"
 
 
@@ -25,7 +25,7 @@ def scripted(responses):
 
 def test_parse_status_variants() -> None:
     st = parse_status(HoldResult(True, [], 0, ACTIVE_OTHER, ""))
-    assert st.active and st.by == "speedfix-s5" and st.reason == "speedfix-s5-matrix"
+    assert st.active and st.by == "other-job" and st.reason == "other-job-matrix"
     st = parse_status(HoldResult(False, [], 1, RELEASED, ""))
     assert not st.active and st.known
     st = parse_status(HoldResult(False, [], 2, "", "Traceback"))
@@ -35,13 +35,13 @@ def test_parse_status_variants() -> None:
 def test_refuses_when_someone_else_holds_it_and_never_acquires() -> None:
     runner, calls = scripted([P(0, ACTIVE_OTHER)])
     hold = BenchHold("/x/bench-hold", name="xpu-llm-bench", runner=runner)
-    with pytest.raises(SafetyError, match="speedfix-s5"):
+    with pytest.raises(SafetyError, match="other-job"):
         hold.guard_and_acquire(30, "ladder")
     assert calls == [["status"]]  # acquire would have silently overwritten it
 
 
 def test_acquires_when_free_and_confirms_ownership() -> None:
-    mine = ACTIVE_OTHER.replace("speedfix-s5 ", "xpu-llm-bench ", 1)
+    mine = ACTIVE_OTHER.replace("other-job ", "xpu-llm-bench ", 1)
     runner, calls = scripted([P(1, RELEASED), P(0, "acquired"), P(0, mine)])
     hold = BenchHold("/x/bench-hold", name="xpu-llm-bench", runner=runner)
     st = hold.guard_and_acquire(30, "ladder")
@@ -67,7 +67,7 @@ def test_release_only_if_ours() -> None:
     runner, calls = scripted([P(0, ACTIVE_OTHER)])
     hold = BenchHold("/x/bench-hold", name="xpu-llm-bench", runner=runner)
     released, note = hold.release_if_ours()
-    assert not released and "speedfix-s5" in note
+    assert not released and "other-job" in note
     assert ["release"] not in calls
 
 
