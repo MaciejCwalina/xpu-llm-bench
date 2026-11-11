@@ -33,6 +33,9 @@ access:
 safety:
   hold_name: xpu-llm-bench-mtp3
   hold_reason: xpu-llm-bench MTP-3 ladder
+ladder:
+  # Progressive: session 1 grows through every context rung, then users join.
+  shape: session1_then_join
 prompts:
   types: [code_edits, long_form, multi_turn_chat]
   seed: 20261111

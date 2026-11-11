@@ -85,7 +85,19 @@ def test_missing_site_file_is_an_error(monkeypatch, tmp_path: Path) -> None:
         site.load_site()
 
 
-def test_example_site_file_parses(monkeypatch) -> None:
+def test_example_site_file_is_rejected_until_filled_in(monkeypatch, tmp_path: Path) -> None:
     _use(monkeypatch, EXAMPLE)
+    with pytest.raises(site.SiteConfigError) as err:
+        site.load_site()
+    msg = str(err.value)
+    assert "host" in msg and "protected_containers[0]" in msg and "forbidden_ports[0]" in msg
+    # The example becomes valid once every placeholder is replaced.
+    filled = EXAMPLE.read_text()
+    for old, new in (("<bench-host>", "lab-box"), ("<production-vllm-container>", "prod-a"),
+                     ("<protected-service-pattern>", "gateway"), ("<production-port>", "9100")):
+        filled = filled.replace(old, new)
+    p = tmp_path / "filled.yaml"
+    p.write_text(filled)
+    _use(monkeypatch, p)
     cfg = site.load_site()
-    assert cfg.forbidden_ports and cfg.protected_containers
+    assert cfg.forbidden_ports == [9100] and cfg.protected_containers == ["prod-a"]

@@ -55,6 +55,6 @@ def test_quick_profile_is_about_ten_minutes() -> None:
 
 
 def test_grid_shape_still_available() -> None:
-    rungs = build_schedule(_spec(shape="grid", context_rungs_tokens=[8192, 32768]))
+    rungs = build_schedule(_spec(shape="grid", allow_grid=True, context_rungs_tokens=[8192, 32768]))
     assert all(r.phase == "meas" for r in rungs)
     assert validate_progressive(rungs) == []

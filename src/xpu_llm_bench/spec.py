@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -56,9 +57,11 @@ class SpeculativeSettings(BaseModel):
 
 
 class HardwareSpec(BaseModel):
-    host: str = "<bench-host>"  # display name; site config `host` overrides
+    host: str = "unspecified"  # display name; site config `host` overrides
     gpu_model: str = "Intel Arc Pro B60"
     gpu_count: int = 2
+    # Device memory per GPU, used by the planner's GPU feasibility check.
+    gpu_mem_gib: float = 24.0
     tensor_parallel: int = 2
     host_ram_gib: float = 25.0
     mem_available_floor_gib: float = 2.0
@@ -77,10 +80,19 @@ class EndpointSpec(BaseModel):
 
 
 class ServerSpec(BaseModel):
-    image: str = "<vllm-xpu-image>:<tag>"  # placeholder; set per spec
-    image_digest: str | None = "TODO-image-digest"
+    """What the test container is EXPECTED to be running.
+
+    The harness never applies these settings. You boot the test container
+    yourself; at preflight the runner reads ``docker inspect`` and checks
+    that ``image``, ``env`` and ``launch_args`` match. A mismatch flags every
+    row NOT_AS_LABELED. Leave a field ``null`` to skip its check; a
+    ``TODO``/``<...>`` placeholder stops a live run at preflight.
+    """
+
+    image: str | None = None  # e.g. the test container's image tag; null: not checked
+    image_digest: str | None = None
     container_name: str = "vllm-bench-test"
-    source_commit: str | None = "TODO-server-source-commit"
+    source_commit: str | None = None
     launch_args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     kv_format: str = "int8_k_int4_v"
@@ -175,8 +187,10 @@ class LadderSpec(BaseModel):
     # every context rung in one conversation; then sessions join one at a time
     # at join_ctx_tokens while earlier sessions stay live and keep decoding.
     # grid: the original scaffold order (all concurrencies at the first rung,
-    # then grow everyone and quiesce down).
-    shape: LadderShape = "grid"
+    # then grow everyone and quiesce down). It starts at the widest point
+    # (every user at once), so it is refused unless allow_grid is also true.
+    shape: LadderShape = "session1_then_join"
+    allow_grid: bool = False
     join_ctx_tokens: int | None = None  # default: first context rung
     # Sampling for measured windows. Greedy keeps A/B workloads identical and
     # makes MTP on/off divergence checks meaningful.
@@ -214,6 +228,16 @@ class LadderSpec(BaseModel):
             raise ValueError("context_rungs_tokens must be unique")
         return v
 
+    @model_validator(mode="after")
+    def _grid_needs_opt_in(self) -> LadderSpec:
+        if self.shape == "grid" and not self.allow_grid:
+            raise ValueError(
+                "ladder.shape=grid starts every user at once at the first rung and steps down; "
+                "it is refused by default. Use the progressive session1_then_join ladder, or set "
+                "ladder.allow_grid: true if you really want grid."
+            )
+        return self
+
     @field_validator("concurrency_steps")
     @classmethod
     def _conc_positive(cls, v: list[int]) -> list[int]:
@@ -232,7 +256,20 @@ class PlannerAssumptions(BaseModel):
     # ESTIMATE placeholder for int8-K / int4-V full-attn KV traffic. Confirm on the bench host.
     assumed_kv_bytes_per_token: int = 24576
     assumed_weight_gib: float = 18.0
+    # Device-side runtime overhead (graphs, activations, allocator slack). ESTIMATE.
     assumed_fixed_overhead_gib: float = 4.0
+    # Host RAM held by the server processes (Python, tokenizer, pinned
+    # buffers). ESTIMATE; replaced by measured RSS when available
+    # (`bench plan --measured results.jsonl`, or live at preflight).
+    assumed_host_process_gib: float = 18.0
+    # Share of the KV footprint that also lives in host RAM (CPU offload /
+    # swap space). 0 for device-only KV.
+    host_kv_fraction: float = 0.0
+    # Leave this much of GPU memory free (fail above, warn above warn_frac).
+    gpu_fail_frac: float = 0.95
+    gpu_warn_frac: float = 0.85
+    # Host RAM: warn when headroom above the MemAvailable floor is below this.
+    host_tight_gib: float = 2.0
     overhead_s_per_rung: float = 3.0
     quality_s_per_rung: float = 6.0
 
@@ -301,8 +338,21 @@ class QualitySpec(BaseModel):
     repetition_max_ratio: float = 0.35
 
 
+class VariantEndpoint(BaseModel):
+    """Per-variant endpoint override: point each variant at its own booted container."""
+
+    base_url: str | None = None
+    metrics_url: str | None = None
+    health_url: str | None = None
+    tokenize_url: str | None = None
+
+
 class VariantSpec(BaseModel):
-    """One side of an A/B (or one-fix) comparison, overlaid on the parent spec."""
+    """One side of an A/B (or one-fix) comparison, overlaid on the parent spec.
+
+    env / launch_args / image are expectations about the container you
+    booted for this variant; they are verified at preflight, never applied.
+    """
 
     name: str
     env: dict[str, str] = Field(default_factory=dict)
@@ -313,6 +363,7 @@ class VariantSpec(BaseModel):
     kv_format: str | None = None
     container_name: str | None = None
     image: str | None = None
+    endpoint: VariantEndpoint | None = None
     notes: str | None = None
 
 
@@ -459,4 +510,40 @@ def apply_variant(spec: RunSpec, variant: VariantSpec) -> RunSpec:
         data["server"]["container_name"] = variant.container_name
     if variant.image is not None:
         data["server"]["image"] = variant.image
+    if variant.endpoint is not None:
+        for key, val in variant.endpoint.model_dump().items():
+            if val is not None:
+                data["endpoint"][key] = val
+    data["variants"] = []
     return RunSpec.model_validate(data)
+
+
+_PLACEHOLDER_RE = re.compile(r"<[^<>\s][^<>]*>|\bTODO\b|TODO-", re.IGNORECASE)
+# Free-text fields that may legitimately mention TODO or <...>.
+_PLACEHOLDER_SKIP = {"notes", "description", "log_patterns", "metrics", "planner"}
+
+
+def is_placeholder(value: object) -> bool:
+    return isinstance(value, str) and bool(_PLACEHOLDER_RE.search(value))
+
+
+def spec_placeholders(spec: RunSpec) -> list[str]:
+    """Dotted paths of spec values that are still TODO / <...> placeholders."""
+    found: list[str] = []
+
+    def walk(obj: Any, path: str) -> None:
+        if isinstance(obj, dict):
+            for key, val in obj.items():
+                if not path and key in _PLACEHOLDER_SKIP:
+                    continue
+                if key in {"notes", "description"}:
+                    continue
+                walk(val, f"{path}.{key}" if path else str(key))
+        elif isinstance(obj, list):
+            for i, val in enumerate(obj):
+                walk(val, f"{path}[{i}]")
+        elif is_placeholder(obj):
+            found.append(f"{path} = {obj!r}")
+
+    walk(spec.model_dump(), "")
+    return found

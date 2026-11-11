@@ -132,7 +132,7 @@
           "type": "string"
         },
         "host": {
-          "default": "<bench-host>",
+          "default": "unspecified",
           "title": "Host",
           "type": "string"
         },
@@ -484,6 +484,11 @@
           "default": null,
           "title": "Kv Format"
         },
+        "launch_check": {
+          "additionalProperties": true,
+          "title": "Launch Check",
+          "type": "object"
+        },
         "notes": {
           "items": {
             "type": "string"
@@ -502,6 +507,13 @@
           ],
           "default": null,
           "title": "Output Jsonl"
+        },
+        "planned_rung_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Planned Rung Ids",
+          "type": "array"
         },
         "profile": {
           "title": "Profile",
@@ -534,6 +546,18 @@
           ],
           "default": null,
           "title": "Server Source Commit"
+        },
+        "site_config": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Site Config"
         },
         "spec_name": {
           "title": "Spec Name",
@@ -575,7 +599,9 @@
           "enum": [
             "in_progress",
             "completed",
-            "aborted"
+            "aborted",
+            "refused",
+            "dry_run"
           ],
           "title": "Status",
           "type": "string"

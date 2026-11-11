@@ -1,6 +1,11 @@
-# Example site config. Copy to bench-site.local.yaml (gitignored), or to
-# ~/.config/xpu-llm-bench/site.yaml, or point $XPU_BENCH_SITE at it, and fill
-# in the real values for your bench host. Never commit the real file.
+# Example site config. Copy to <repo root>/bench-site.local.yaml (gitignored),
+# or to ~/.config/xpu-llm-bench/site.yaml, or point $XPU_BENCH_SITE at it, and
+# replace EVERY <...> value with the real one for your bench host. Never commit
+# the real file. The current directory is NOT searched.
+#
+# The loader rejects any value that still contains <...>, TODO, example or
+# changeme, and requires host, protected_containers and forbidden_ports.
+# `bench plan` and `bench run` print which site file they loaded.
 #
 # Everything here only ADDS protection to the built-in neutral defaults
 # (container "vllm-production", port 8001, CI-runner name patterns).
@@ -19,7 +24,7 @@ protected_patterns:
 # Host ports of production endpoints. Endpoints and test containers bound to
 # these ports are refused.
 forbidden_ports:
-  - 8001
+  - <production-port>
 
 # Path of the bench-hold CLI on the bench host.
 hold_command: bench-hold

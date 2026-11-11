@@ -46,6 +46,8 @@ prompts:
   types: [code_edits, long_form, multi_turn_chat]
   seed: 20261111
 ladder:
+  # Progressive: session 1 grows through every context rung, then users join.
+  shape: session1_then_join
   context_rungs_tokens: [8192, 32768, 65536, 131072]
   concurrency_steps: [1, 2, 4, 8]
   load_modes: [closed_all_decoding, staggered, open_loop]

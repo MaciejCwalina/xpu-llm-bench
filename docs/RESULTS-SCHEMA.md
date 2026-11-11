@@ -4,7 +4,8 @@ A run writes these files under `--output-dir/<spec-name>/`:
 
 - `manifest.json`: identity, fingerprint, boot evidence, host facts, hold state, and `completed_rung_ids` (the resume cursor).
 - `results.jsonl`: one JSON object per measured rung, in schedule order.
-- `sessions.json`: every live conversation verbatim, used by `--resume` to re-prefill. Never edit it.
+- `sessions.json`: a compact record of every live conversation, used by `--resume` to re-prefill: user turns as (segment, n_chars, opener, sha256), regenerated from the seeded corpus on load; model replies verbatim. Never edit it. Not written by `--dry-run`.
+- `dry-run/`: a `--dry-run` writes its own `manifest.json` (`status: dry_run`, `planned_rung_ids`) and `DRY_RUN` rows here, never next to a real run.
 - `greedy_outputs.jsonl`: greedy window outputs (`probe_id`, token ids, text). This is the MTP on/off reference.
 - `logprob_scores.jsonl`: teacher-forced probe scores. A dense run's file is the logprob baseline.
 
@@ -19,7 +20,10 @@ both with explicit offsets. Definitions of every metric are in
 | Field | Meaning |
 |---|---|
 | `run_id`, `spec_name`, `spec_path`, `profile`, `tool_version` | What produced the run |
-| `started_*`, `finished_*`, `status`, `abort_reason` | `in_progress` / `completed` / `aborted` (RAM floor, OOM, SPEC_ASSERT, engine error) |
+| `started_*`, `finished_*`, `status`, `abort_reason` | `in_progress` / `completed` / `aborted` (RAM floor, OOM, SPEC_ASSERT, engine error) / `refused` (preflight or bench-hold refused; nothing ran) / `dry_run` (ignored by `--resume`) |
+| `planned_rung_ids` | `--dry-run` only: the rungs a live run would execute |
+| `site_config` | which site config file was loaded (or that none was) |
+| `launch_check` | spec env / launch_args / image vs `docker inspect` (`mismatches` → `NOT_AS_LABELED`), plus the preflight feasibility result |
 | `prompt_seed`, `k` | Fixed workload seed; declared k (null if undeclared) |
 | `fingerprint` | `build_fingerprint`, `launch_fingerprint`, image id, per-mount hashes, StartedAt, redacted env |
 | `boot` | Parsed boot evidence (attention_boot, QSA_WRAP / QSA_MEMORY_PLAN / banner, graphs, capture sizes, KV dtype and tokens, speculative config) |
@@ -82,6 +86,7 @@ Fields on the row that are not in the table: `session_seeds`, `temperature`,
 | `QUALITY_FAIL` | A quality check failed on this rung (see quality fields). |
 | `CONVERTED` | Value converted from a legacy definition (import-legacy). |
 | `DRY_RUN` | Placeholder row from --dry-run. |
+| `HIT_RATE_UNKNOWN` | Imported row: no tokens_per_step / drafts to derive the true hit rate; hit_rate left empty (the acceptance counter is never used as hit_rate). |
 
 ## Comparison
 

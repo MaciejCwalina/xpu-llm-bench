@@ -216,10 +216,13 @@ def non_comparable_reasons(a: RungResult, b: RungResult) -> list[str]:
         drift = max(abs(x - y) / max(x, y, 1) for x, y in zip(a.ctx_tokens, b.ctx_tokens, strict=False))
         if drift > 0.05:
             reasons.append(f"session contexts differ by {drift:.0%}")
+    # Two imported rows share the same legacy conversion; only flag a legacy-vs-new pair.
+    both_converted = "CONVERTED" in a.flags and "CONVERTED" in b.flags
     for side, row in (("A", a), ("B", b)):
         for flag in row.flags:
-            if flag not in {"K_UNDECLARED"}:
-                reasons.append(f"{side} flagged {flag}")
+            if flag in {"K_UNDECLARED"} or (both_converted and flag == "CONVERTED"):
+                continue
+            reasons.append(f"{side} flagged {flag}")
         if row.attention_path == "fallback":
             reasons.append(f"{side} ran a silent fallback path")
         if row.attention_path == "mixed":
@@ -246,10 +249,22 @@ class ComparePair:
     deltas: dict[str, float | None]
 
 
+def compare_key(row: RungResult) -> tuple[int, int, str]:
+    """Rows pair on users + context + prompt type. load_mode / phase / k
+    differences do not split the pair; they mark it NON-COMPARABLE instead."""
+    return (row.users, row.ctx_per_user, row.prompt_type)
+
+
 def _index(rows: list[RungResult]) -> dict[tuple, RungResult]:
+    """Index by compare_key plus an occurrence number, so repeated keys in one
+    run (e.g. two load modes) are kept as separate pairs, never collapsed."""
     out: dict[tuple, RungResult] = {}
+    seen: dict[tuple, int] = {}
     for row in rows:
-        out[row.comparable_key] = row
+        base = compare_key(row)
+        n = seen.get(base, 0)
+        seen[base] = n + 1
+        out[(*base, n)] = row
     return out
 
 
@@ -287,7 +302,15 @@ def format_compare(pairs: list[ComparePair], name_a: str = "A", name_b: str = "B
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for pair in pairs:
-        users, ctx, ptype, mode, phase = pair.key
+        users, ctx, ptype = pair.key[:3]
+        ref = pair.a or pair.b
+        mode = ref.load_mode if ref else ""
+        phase = ref.phase if ref else ""
+        if pair.a is not None and pair.b is not None:
+            if pair.a.load_mode != pair.b.load_mode:
+                mode = f"{pair.a.load_mode}/{pair.b.load_mode}"
+            if pair.a.phase != pair.b.phase:
+                phase = f"{pair.a.phase}/{pair.b.phase}"
         if pair.a is None or pair.b is None:
             flag = "NON-COMPARABLE: " + "; ".join(pair.reasons)
             lines.append(f"| {users} | {ctx} | {ptype} | {mode} | {phase} |  |  |  |  | {flag} |")

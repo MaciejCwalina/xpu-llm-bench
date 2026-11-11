@@ -15,7 +15,9 @@ The runner never starts, stops, or restarts any container.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import sys
 import threading
 import time
 import uuid
@@ -27,7 +29,7 @@ from typing import Any
 from xpu_llm_bench import bootlog, hostinfo, procmem
 from xpu_llm_bench.client import OpenAICompatClient, StreamResult
 from xpu_llm_bench.container import ContainerAdapter
-from xpu_llm_bench.fingerprint import Fingerprint, collect_fingerprint
+from xpu_llm_bench.fingerprint import Fingerprint, collect_fingerprint, verify_expected
 from xpu_llm_bench.gpu_mem import collect_gpu_mem
 from xpu_llm_bench.hold import BenchHold
 from xpu_llm_bench.hostexec import HostExec
@@ -46,7 +48,7 @@ from xpu_llm_bench.metrics import (
     true_hit_rate,
 )
 from xpu_llm_bench.path_classify import classify_logs
-from xpu_llm_bench.planner import make_plan
+from xpu_llm_bench.planner import GRID_WARNING, feasibility, make_plan
 from xpu_llm_bench.prompts import corpus, load_corpus_dir, needle_for, session_seed
 from xpu_llm_bench.quality import (
     code_task_for,
@@ -82,7 +84,8 @@ from xpu_llm_bench.safety import (
     site_forbidden_ports,
 )
 from xpu_llm_bench.schedule import Rung, build_schedule
-from xpu_llm_bench.spec import RunSpec, apply_variant
+from xpu_llm_bench.site import describe_site, load_site
+from xpu_llm_bench.spec import RunSpec, apply_variant, is_placeholder, spec_placeholders
 
 ABORTING_EXITS = {"RAM_FLOOR", "OOM", "SPEC_ASSERT", "ENGINE_ERROR"}
 
@@ -121,6 +124,8 @@ class Session:
         self.segments = 0
         self.needles: list[dict[str, Any]] = []
         self.ctx_tokens = 0  # last server-reported prompt_tokens
+        # Compact, regenerable record of each turn (see to_dict).
+        self.turns: list[dict[str, Any]] = []
         # back-compat with the scaffold API
         self.prefix = ""
 
@@ -144,16 +149,28 @@ class Session:
         if need <= 0 and self.messages and self.messages[-1]["role"] == "user":
             return self.messages
         n_chars = max(int(max(need, 32) * self.cpt), 64)
-        needle_text = None
         if self.plant_needles:
-            fact, question, answer = needle_for(self.seed, self.segments)
-            needle_text = fact
+            _fact, question, answer = needle_for(self.seed, self.segments)
             self.needles.append({"segment": self.segments, "question": question, "answer": answer})
-        body = self.corpus.segment(n_chars, self.segments, needle=needle_text)
-        opener = self.corpus.opener() if not self.messages else ""
-        self.messages.append({"role": "user", "content": opener + body + self.corpus.ask()})
+        opener = not self.messages
+        content = self._user_text(n_chars, self.segments, opener)
+        self.messages.append({"role": "user", "content": content})
+        self.turns.append(
+            {
+                "role": "user",
+                "segment": self.segments,
+                "n_chars": n_chars,
+                "opener": opener,
+                "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            }
+        )
         self.segments += 1
         return self.messages
+
+    def _user_text(self, n_chars: int, segment: int, opener: bool) -> str:
+        needle_text = needle_for(self.seed, segment)[0] if self.plant_needles else None
+        body = self.corpus.segment(n_chars, segment, needle=needle_text)
+        return (self.corpus.opener() if opener else "") + body + self.corpus.ask()
 
     def grow_message(self, target_tokens: int) -> list[dict[str, str]]:  # scaffold name
         return self.grow_to(target_tokens)
@@ -161,15 +178,21 @@ class Session:
     def append_reply(self, text: str) -> None:
         reply, _ = cut_at_eos(text)
         if self.messages and self.messages[-1]["role"] == "user":
-            self.messages.append({"role": "assistant", "content": reply.strip() or "(no reply)"})
+            content = reply.strip() or "(no reply)"
+            self.messages.append({"role": "assistant", "content": content})
+            self.turns.append({"role": "assistant", "content": content})
 
     def to_dict(self) -> dict[str, Any]:
+        """Compact state: user turns are stored as (segment, n_chars, opener,
+        sha256) and regenerated from the seeded corpus on resume; only the
+        model's own replies are stored verbatim."""
         return {
+            "format": 2,
             "sid": self.sid,
             "prompt_type": self.prompt_type,
             "seed": self.seed,
             "cpt": self.cpt,
-            "messages": self.messages,
+            "turns": self.turns,
             "segments": self.segments,
             "needles": self.needles,
             "ctx_tokens": self.ctx_tokens,
@@ -177,10 +200,26 @@ class Session:
 
     def load_state(self, d: dict[str, Any]) -> None:
         self.cpt = float(d.get("cpt") or self.cpt)
-        self.messages = list(d.get("messages") or [])
         self.segments = int(d.get("segments") or 0)
         self.needles = list(d.get("needles") or [])
         self.ctx_tokens = int(d.get("ctx_tokens") or 0)
+        if "turns" not in d:  # format 1: full messages stored verbatim
+            self.messages = list(d.get("messages") or [])
+            self.turns = []
+            return
+        self.turns = list(d["turns"])
+        self.messages = []
+        for turn in self.turns:
+            if turn["role"] == "assistant":
+                self.messages.append({"role": "assistant", "content": turn["content"]})
+                continue
+            text = self._user_text(int(turn["n_chars"]), int(turn["segment"]), bool(turn["opener"]))
+            if turn.get("sha256") and hashlib.sha256(text.encode("utf-8")).hexdigest() != turn["sha256"]:
+                raise ValueError(
+                    f"session {self.sid}: regenerated turn {turn['segment']} does not match the saved hash "
+                    "(prompt corpus, seed or code changed); resume refused, start a fresh run"
+                )
+            self.messages.append({"role": "user", "content": text})
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +343,14 @@ def safety_preflight(spec: RunSpec) -> None:
 # ---------------------------------------------------------------------------
 
 
+class RunRefused(SafetyError):
+    """Preflight or bench-hold refused a run. The manifest is marked refused."""
+
+    def __init__(self, message: str, manifest: RunManifest | None = None):
+        super().__init__(message)
+        self.manifest = manifest
+
+
 class Runner:
     def __init__(
         self,
@@ -324,11 +371,18 @@ class Runner:
         proc_fn: Callable[[], procmem.ProcSnapshot] | None = None,
         host_fn: Callable[[], dict] | None = None,
         ram_wait_min: float = 0.0,
+        no_site_config: bool = False,
+        require_container: bool = True,
     ):
         self.spec = spec
-        self.output_dir = Path(output_dir)
+        # Dry runs never share a directory (or a manifest) with a real run.
+        self.output_dir = Path(output_dir) / "dry-run" if dry_run else Path(output_dir)
         self.dry_run = dry_run
-        self.resume = resume
+        self.resume = resume and not dry_run
+        self.no_site_config = no_site_config
+        self.require_container = require_container
+        self.launch_mismatches: list[str] = []
+        self.preflight_warnings: list[str] = []
         self.client = client or OpenAICompatClient(
             spec.endpoint.base_url,
             spec.endpoint.model,
@@ -396,8 +450,10 @@ class Runner:
             return None
         try:
             return collect_fingerprint(self.exec, name)
-        except Exception:  # noqa: BLE001
-            return None
+        except Exception as exc:  # noqa: BLE001
+            fp = Fingerprint(name, None, None, None, [], None)
+            fp.problems.append(f"docker inspect failed: {exc!r}"[:300])
+            return fp
 
     def _procs(self) -> procmem.ProcSnapshot:
         if self._proc_fn:
@@ -674,6 +730,8 @@ class Runner:
                 flags.append("GRAPH_MISS")
         if batch is not None and sizes and batch > max(sizes):
             flags.append("GRAPH_MISS")
+        if self.launch_mismatches:
+            flags.append("NOT_AS_LABELED")
         if attention_runtime == "fallback":
             flags.append("QSA_FALLBACK")
         if attention_runtime == "mixed":
@@ -712,8 +770,7 @@ class Runner:
             started_et=et0,
         )
         if self.dry_run:
-            for sid in rung.grow_sessions:
-                sessions[sid].grow_to(rung.target_for(sid))
+            for sid in rung.grow_sessions:  # no prompt text is generated or stored
                 sessions[sid].ctx_tokens = rung.target_for(sid)
             utc1, et1 = stamp_pair()
             return RungResult(
@@ -993,23 +1050,109 @@ class Runner:
         )
 
     # -- preflight ------------------------------------------------------------
-    def _preflight(self, manifest: RunManifest) -> None:
+    def _would_run(self) -> list[str]:
+        cmd, name = self.hold.command, self.hold.name
+        lines = [
+            f"{cmd} status",
+            f"{cmd} acquire {self.spec.safety.hold_minutes} {self.spec.safety.hold_reason!r} --by {name}",
+            f"{cmd} status",
+            "...",
+            f"{cmd} release  (only if status still shows by={name})",
+        ]
+        if self.spec.safety.quiet_hold_file:
+            lines.insert(0, f"read {self.spec.safety.quiet_hold_file}  (an active quiet hold blocks the run)")
+        if self.spec.server.container_name:
+            lines.insert(0, f"docker inspect {self.spec.server.container_name}  (must exist and be running)")
+        return lines
+
+    def _preflight(self, manifest: RunManifest, rungs: list[Rung]) -> None:
         safety_preflight(self.spec)
+        site = load_site()
+        manifest.site_config = describe_site()
+        problems: list[str] = []
+        warnings: list[str] = []
+        if not site.source:
+            msg = (
+                "no site config found: production containers/ports of this host are NOT protected beyond the "
+                "built-in neutral defaults. Create one (README 'Site config') or pass --no-site-config to "
+                "acknowledge."
+            )
+            if self.no_site_config:
+                msg = (
+                    "running WITHOUT a site config (--no-site-config): only the built-in neutral "
+                    "protection applies"
+                )
+            (warnings if (self.no_site_config or self.dry_run) else problems).append(msg)
+        holes = spec_placeholders(self.spec)
+        if holes:
+            msg = (
+                "spec still has placeholder values (set each to the real value, or to null to skip its check):\n    "
+                + "\n    ".join(holes)
+            )
+            (warnings if self.dry_run else problems).append(msg)
+        if self.spec.ladder.shape == "grid":
+            warnings.append(GRID_WARNING)
         if self.dry_run:
-            manifest.hold = {"dry_run": True, "would_run": [
-                f"{self.hold.command} status",
-                f"{self.hold.command} acquire {self.spec.safety.hold_minutes} {self.spec.safety.hold_reason!r} --by {self.hold.name}",
-                f"{self.hold.command} status",
-                "...",
-                f"{self.hold.command} release  (only if status still shows by={self.hold.name})",
-            ]}
+            manifest.hold = {"dry_run": True, "would_run": self._would_run()}
+            self.preflight_warnings = warnings
+            manifest.launch_check = {"checked": False, "warnings": warnings}
+            if problems:
+                raise RunRefused("\n".join(problems), manifest)
             return
+        if problems:  # stop before touching docker or the host
+            raise RunRefused("\n".join(problems), manifest)
         self.fp = self._fingerprint()
-        if self.fp:
-            bad = set(self.fp.host_ports) & site_forbidden_ports(self.spec.safety.forbidden_ports)
+        fp = self.fp
+        if self.require_container:
+            name = self.spec.server.container_name
+            if fp is None or not fp.container_id:
+                why = "; ".join(fp.problems) if fp and fp.problems else "no fingerprint"
+                problems.append(
+                    f"test container {name!r} not found ({why}). Boot it yourself first and point "
+                    "server.container_name / endpoint.base_url at it (README 'Prerequisites')."
+                )
+            elif fp.state_status and fp.state_status != "running":
+                problems.append(f"test container {name!r} is {fp.state_status}, not running")
+        if fp and fp.container_id:
+            bad = set(fp.host_ports) & site_forbidden_ports(self.spec.safety.forbidden_ports)
             if bad:
-                raise SafetyError(f"Refusing: container {self.fp.container} is bound to production port(s) {sorted(bad)}")
-            manifest.fingerprint = self.fp.to_dict()
+                raise SafetyError(f"Refusing: container {fp.container} is bound to production port(s) {sorted(bad)}")
+            manifest.fingerprint = fp.to_dict()
+            srv = self.spec.server
+            self.launch_mismatches = verify_expected(
+                fp, srv.env, srv.launch_args, srv.image, srv.image_digest, is_placeholder=is_placeholder
+            )
+            manifest.launch_check = {
+                "checked": True,
+                "ok": not self.launch_mismatches,
+                "mismatches": self.launch_mismatches,
+                "note": "env / launch_args / image are expectations verified against docker inspect, not applied",
+            }
+            if self.launch_mismatches:
+                warnings.append(
+                    "container does not match the spec; every row will be flagged NOT_AS_LABELED:\n    "
+                    + "\n    ".join(self.launch_mismatches)
+                )
+        else:
+            manifest.launch_check = {"checked": False, "reason": "no container fingerprint"}
+        # Feasibility with measured server RSS when available.
+        measured = None
+        try:
+            snap = self._procs()
+            rss = sum(int(v) for v in (getattr(snap, "ours", None) or {}).values() if v)
+            measured = rss / (1024 * 1024) if rss else None
+        except Exception:  # noqa: BLE001
+            measured = None
+        feas = feasibility(self.spec, rungs, measured)
+        manifest.launch_check["feasibility"] = {
+            "gpu": feas.gpu_status, "host": feas.host_status, "host_basis": feas.host_basis,
+            "host_need_gib": round(feas.host_need_gib, 2), "gpu_need_gib": round(feas.estimated_total_gib, 2),
+        }
+        if not feas.ok:
+            problems.extend(feas.failures)
+        self.preflight_warnings = warnings
+        if problems:
+            raise RunRefused("\n".join(problems), manifest)
         try:
             self.boot = bootlog.parse_boot(self._logs_text(tail=200000), self.spec.log_patterns)
         except Exception:  # noqa: BLE001
@@ -1020,6 +1163,13 @@ class Runner:
             manifest.attention.evidence_lines = self.boot.evidence[:20]
         manifest.host = self._host()
 
+    def _refuse(self, manifest: RunManifest, exc: Exception) -> RunRefused:
+        manifest.status = "refused"
+        manifest.abort_reason = str(exc)
+        manifest.finished_utc, manifest.finished_et = stamp_pair()
+        self._write_manifest(manifest)
+        return RunRefused(str(exc), manifest)
+
     # -- main loop -------------------------------------------------------------
     def run(self) -> RunManifest:
         rungs = build_schedule(self.spec)
@@ -1029,8 +1179,11 @@ class Runner:
         prior_boot = None
         if self.resume and (self.output_dir / "manifest.json").exists():
             manifest = RunManifest.load(self.output_dir / "manifest.json")
-            completed = set(manifest.completed_rung_ids)
-            prior_boot = (manifest.fingerprint or {}).get("started_at")
+            if manifest.status == "dry_run":
+                manifest = None  # a dry run never counts as progress
+            else:
+                completed = set(manifest.completed_rung_ids)
+                prior_boot = (manifest.fingerprint or {}).get("started_at")
         if manifest is None:
             manifest = self.new_manifest(_run_id(self.spec.name), rungs)
             if jsonl.exists():
@@ -1040,8 +1193,14 @@ class Runner:
         run_id = manifest.run_id
 
         # Safety and identity before anything touches the server.
-        self._preflight(manifest)
+        try:
+            self._preflight(manifest, rungs)
+        except (SafetyError, RunRefused) as exc:
+            raise self._refuse(manifest, exc) from None
         self._write_manifest(manifest)
+        if not self.dry_run:
+            for warn in self.preflight_warnings:
+                print(f"WARNING: {warn}", file=sys.stderr, flush=True)
 
         watcher = RamWatcher(floor_gib=self.spec.hardware.mem_available_floor_gib, source=self.ram_source, interval_s=0.5)
         try:
@@ -1054,12 +1213,15 @@ class Runner:
             raise
 
         if not self.dry_run:
-            st = self.hold.guard_and_acquire(
-                self.spec.safety.hold_minutes,
-                self.spec.safety.hold_reason,
-                quiet_hold_file=self.spec.safety.quiet_hold_file,
-                read_file=self._read_remote if self.spec.access.mode == "ssh" else None,
-            )
+            try:
+                st = self.hold.guard_and_acquire(
+                    self.spec.safety.hold_minutes,
+                    self.spec.safety.hold_reason,
+                    quiet_hold_file=self.spec.safety.quiet_hold_file,
+                    read_file=self._read_remote if self.spec.access.mode == "ssh" else None,
+                )
+            except SafetyError as exc:
+                raise self._refuse(manifest, exc) from None
             manifest.hold = {"by": st.by, "until": st.until, "acquired_by_runner": True}
             self._write_manifest(manifest)
             watcher.start()
@@ -1135,6 +1297,11 @@ class Runner:
                         ram_floor=True, mem_min=watcher.min_gib(),
                     )
                 write_jsonl_row(jsonl, row)
+                if self.dry_run:
+                    # Dry runs record what would run; nothing is completed or resumable.
+                    manifest.planned_rung_ids.append(rung.rung_id)
+                    self._write_manifest(manifest)
+                    continue
                 self._save_sessions(sessions)
                 if row.exit_reason in ABORTING_EXITS and row.valid == "invalid":
                     if row.exit_reason == "RAM_FLOOR" and self.ram_wait_min > 0 and self._wait_for_ram(watcher):
@@ -1159,6 +1326,8 @@ class Runner:
         if abort_reason:
             manifest.status = "aborted"
             manifest.abort_reason = abort_reason
+        elif self.dry_run:
+            manifest.status = "dry_run"
         else:
             manifest.status = "completed"
         self._write_manifest(manifest)
@@ -1195,13 +1364,48 @@ def run_spec(
     output_root: str | Path,
     dry_run: bool = False,
     resume: bool = False,
+    variant: str | None = None,
+    pause_between_variants: bool = False,
+    prompt: Callable[[str], str] | None = None,
+    say: Callable[[str], None] | None = None,
     **kwargs: Any,
 ) -> list[RunManifest]:
-    """Run a spec, expanding comparison variants into sequential one-boot runs."""
+    """Run a spec, expanding comparison variants into sequential one-boot runs.
+
+    Each variant must run against its own booted container: pick one with
+    ``variant``, give every variant its own ``endpoint.base_url``, or set
+    ``pause_between_variants`` to be prompted to reboot the test container
+    between variants.
+    """
+    say = say or (lambda msg: print(msg, flush=True))
     manifests: list[RunManifest] = []
-    variants = spec.variants or [None]
-    for var in variants:
+    chosen = list(spec.variants)
+    if variant is not None:
+        chosen = [v for v in spec.variants if v.name == variant]
+        if not chosen:
+            names = ", ".join(v.name for v in spec.variants) or "(spec has no variants)"
+            raise ValueError(f"unknown variant {variant!r}; choose one of: {names}")
+    elif len(chosen) > 1 and not dry_run and not pause_between_variants:
+        expanded = [apply_variant(spec, v) for v in chosen]
+        urls = [e.endpoint.base_url for e in expanded]
+        if len(set(urls)) != len(urls):
+            raise ValueError(
+                "this spec has variants that share one endpoint, so they would all hit the same container. "
+                "Run one variant at a time with --variant NAME (booting its container first), give each variant "
+                "its own endpoint.base_url, or pass --pause-between-variants."
+            )
+    variants = chosen or [None]
+    for i, var in enumerate(variants):
         one = apply_variant(spec, var) if var is not None else spec
+        if var is not None and pause_between_variants and not dry_run:
+            env = " ".join(f"{k}={v}" for k, v in one.server.env.items()) or "(none)"
+            args = " ".join(one.server.launch_args) or "(none)"
+            msg = (
+                f"\n[{i + 1}/{len(variants)}] Variant {var.name!r}: boot container "
+                f"{one.server.container_name!r} at {one.endpoint.base_url} with env {env} and args {args}, "
+                "then press Enter (Ctrl-C to stop) "
+            )
+            (prompt or input)(msg)
         out = Path(output_root) / one.name
         runner = Runner(one, out, dry_run=dry_run, resume=resume, **kwargs)
         manifests.append(runner.run())

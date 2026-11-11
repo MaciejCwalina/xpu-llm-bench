@@ -24,5 +24,8 @@ hardware:
   mem_available_floor_gib: 2
 safety:
   hold_name: xpu-llm-bench-mtp-off
+ladder:
+  # Progressive: session 1 grows through every context rung, then users join.
+  shape: session1_then_join
 prompts:
   seed: 20261111

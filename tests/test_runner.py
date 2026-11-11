@@ -56,11 +56,13 @@ def test_runner_against_mock_server(mock_server, tmp_path: Path) -> None:
         ram_source=LocalMemInfo(str(mem)),
         fetch_logs=lambda: "\n".join(mock_server["logs"]),
         collect_mem=lambda **kwargs: "kv_cache 12.5%",
+        no_site_config=True,
+        require_container=False,
     )
     manifest = runner.run()
     assert manifest.status == "completed"
     rows = read_jsonl(tmp_path / "out" / "results.jsonl")
-    assert len(rows) == 4  # 1u@64, 2u@64, 2u@128, 1u@128
+    assert len(rows) == 3  # progressive: 1u@64, 1u@128 (session 1 grows), then 2u join at 64
     ids = [r.rung_id for r in rows]
     assert ids == sorted(ids, key=lambda x: ids.index(x))  # stable order
     assert {r.users for r in rows} == {1, 2}
@@ -95,6 +97,8 @@ def test_resume_skips_completed(mock_server, tmp_path: Path) -> None:
         ram_source=LocalMemInfo(str(mem)),
         fetch_logs=lambda: "QSA_GRAPH width=65536",
         collect_mem=lambda **kwargs: None,
+        no_site_config=True,
+        require_container=False,
     )
     first = Runner(**kwargs).run()
     rows1 = read_jsonl(out / "results.jsonl")
@@ -118,8 +122,9 @@ def test_dry_run_writes_rows_without_http(tmp_path: Path) -> None:
         ram_source=LocalMemInfo(str(mem)),
     )
     manifest = runner.run()
-    assert manifest.status == "completed"
-    rows = read_jsonl(tmp_path / "dry" / "results.jsonl")
+    assert manifest.status == "dry_run"
+    assert manifest.completed_rung_ids == [] and manifest.planned_rung_ids
+    rows = read_jsonl(tmp_path / "dry" / "dry-run" / "results.jsonl")
     assert rows
     assert all(r.reason == "dry-run" for r in rows)
 
@@ -141,6 +146,6 @@ def test_ram_floor_aborts_and_is_resumable(tmp_path: Path) -> None:
 
     with pytest.raises(RamFloorError):
         runner.run()
-    manifest = RunManifest.load(tmp_path / "abort" / "manifest.json")
+    manifest = RunManifest.load(tmp_path / "abort" / "dry-run" / "manifest.json")
     assert manifest.status == "aborted"
     assert "floor" in (manifest.abort_reason or "").lower()

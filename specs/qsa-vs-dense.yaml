@@ -43,6 +43,8 @@ prompts:
   types: [code_edits, long_form, multi_turn_chat]
   seed: 20261111
 ladder:
+  # Progressive: session 1 grows through every context rung, then users join.
+  shape: session1_then_join
   # Progressive schedule still grows 8K then 131K (and optionally mid rungs).
   # 32K/64K omitted here to keep this A/B closer to the four historical cells;
   # use qsa-full-fix-mtp6 + prod-dense-baseline for the complete matrix.
@@ -53,6 +55,13 @@ ladder:
   warmup: {tokens: 16, requests: 1}
   grow_monotonically: true
   boot_once: true
+# Each variant runs against ITS OWN booted container. env / launch_args / image
+# below are what that container is expected to run: they are checked against
+# `docker inspect` at preflight (NOT_AS_LABELED on mismatch), never applied.
+# Variants here share one endpoint, so run them one at a time:
+#   bench run SPEC --variant NAME            (boot that variant first), or
+#   bench run SPEC --pause-between-variants  (prompts you to reboot between them),
+# or give each variant its own endpoint: {base_url, metrics_url, health_url}.
 variants:
   - name: qsa
     env: {K8V4_QSA: "1"}

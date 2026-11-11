@@ -19,7 +19,19 @@ def _spec(**kwargs) -> RunSpec:
 
 
 def test_never_shrinks_and_covers_matrix() -> None:
-    rungs = build_schedule(_spec())
+    # The old grid order, explicitly opted into.
+    rungs = build_schedule(
+        _spec(
+            ladder={
+                "shape": "grid",
+                "allow_grid": True,
+                "context_rungs_tokens": [8192, 32768],
+                "concurrency_steps": [1, 2, 4, 8],
+                "load_modes": ["closed_all_decoding"],
+                "output_tokens_per_rung": 32,
+            }
+        )
+    )
     errors = validate_progressive(rungs)
     assert errors == []
     # Two prompt types × (4 concurrencies at 8K + 4 at 32K)

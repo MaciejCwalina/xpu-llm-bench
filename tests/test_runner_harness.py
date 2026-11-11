@@ -50,6 +50,8 @@ def _runner(spec, out, mock, tmp_path, **kw):
         mem.write_text("MemAvailable: 8388608 kB\n")
     kw.setdefault("hold", BenchHold("/bin/true", dry_run=True))
     kw.setdefault("ram_source", LocalMemInfo(str(mem)))
+    kw.setdefault("no_site_config", True)
+    kw.setdefault("require_container", False)
     return Runner(
         spec,
         out,
@@ -101,8 +103,9 @@ def test_prompts_are_seeded_not_time_based(mock_server, tmp_path: Path) -> None:
     _runner(spec, tmp_path / "b", mock_server, tmp_path).run()
     sa = json.loads((tmp_path / "a" / "sessions.json").read_text())
     sb = json.loads((tmp_path / "b" / "sessions.json").read_text())
-    users = lambda d: [[m["content"] for m in s["messages"] if m["role"] == "user"] for s in d.values()]  # noqa: E731
-    assert users(sa) == users(sb)
+    # Compact format: user turns are (segment, n_chars, opener, sha256), regenerated on load.
+    users = lambda d: [[t["sha256"] for t in s["turns"] if t["role"] == "user"] for s in d.values()]  # noqa: E731
+    assert users(sa) == users(sb) and users(sa)[0]
 
 
 def test_k_from_spec_drives_hit_rate_and_flags_mismatch(mock_server, tmp_path: Path) -> None:
@@ -198,9 +201,9 @@ def test_dry_run_makes_no_requests_and_flags_rows(mock_server, tmp_path: Path) -
     spec = _spec(mock_server["base"])
     r = _runner(spec, tmp_path / "o", mock_server, tmp_path, dry_run=True)
     man = r.run()
-    assert man.status == "completed"
+    assert man.status == "dry_run"
     assert mock_server["state"].chat_requests == 0
-    rows = read_jsonl(tmp_path / "o" / "results.jsonl")
+    rows = read_jsonl(tmp_path / "o" / "dry-run" / "results.jsonl")
     assert rows and all(row.flags == ["DRY_RUN"] for row in rows)
     assert "would_run" in man.hold
 

@@ -41,6 +41,7 @@ FLAGS: dict[str, str] = {
     "RESUMED_REFILL": "First rung after --resume on a new boot: sessions were re-prefilled.",
     "QUALITY_FAIL": "A quality check failed on this rung (see quality fields).",
     "CONVERTED": "Value converted from a legacy definition (import-legacy).",
+    "HIT_RATE_UNKNOWN": "Imported row: no tokens_per_step / drafts to derive the true hit rate; hit_rate left empty (the acceptance counter is never used as hit_rate).",
     "DRY_RUN": "Placeholder row from --dry-run.",
 }
 
@@ -62,7 +63,7 @@ def stamp_pair(now: datetime | None = None) -> tuple[str, str]:
 
 
 class HardwareSnapshot(BaseModel):
-    host: str = "<bench-host>"
+    host: str = "unspecified"
     gpu_model: str = "Intel Arc Pro B60"
     gpu_count: int = 2
     tensor_parallel: int = 2
@@ -229,8 +230,16 @@ class RunManifest(BaseModel):
     started_et: str
     finished_utc: str | None = None
     finished_et: str | None = None
-    status: Literal["in_progress", "completed", "aborted"] = "in_progress"
+    # dry_run: a --dry-run manifest (written under <out>/dry-run/); --resume ignores it.
+    # refused: preflight or bench-hold refused the run before any rung ran.
+    status: Literal["in_progress", "completed", "aborted", "refused", "dry_run"] = "in_progress"
     abort_reason: str | None = None
+    # Rung ids a --dry-run would execute (never counted as completed).
+    planned_rung_ids: list[str] = Field(default_factory=list)
+    # Which site config file was in effect (or that none was).
+    site_config: str | None = None
+    # Spec expectations (env / launch_args / image) checked against docker inspect.
+    launch_check: dict[str, Any] = Field(default_factory=dict)
     image: str | None = None
     image_digest: str | None = None
     server_source_commit: str | None = None

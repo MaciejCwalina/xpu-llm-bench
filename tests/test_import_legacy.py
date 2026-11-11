@@ -14,7 +14,9 @@ def test_import_maps_fields(tmp_path: Path) -> None:
     assert rows[0].users == 1
     assert rows[0].ctx_per_user == 8192
     assert rows[0].decode_tok_s_total == 60.0
-    assert rows[0].hit_rate == 0.48
+    # The acceptance counter is never used as hit_rate.
+    assert rows[0].hit_rate is None and "HIT_RATE_UNKNOWN" in rows[0].flags
+    assert rows[0].acceptance_rate_vllm == 0.48
     assert rows[0].ttft_ms == 1500
     assert abs(rows[0].mem_available_min_gib - 3.0) < 1e-6
     assert rows[1].users == 2
@@ -29,5 +31,6 @@ def test_mtp6_correction(tmp_path: Path) -> None:
         FIX / "legacy_rungs.jsonl", dest, correct_mtp6_hit_rate=True, run_id="old"
     )
     rows = read_jsonl(dest)
-    assert rows[0].hit_rate == 0.48 * MTP6_HIT_RATE_CORRECTION
+    assert rows[0].hit_rate is None
+    assert rows[0].acceptance_rate_vllm == 0.48 * MTP6_HIT_RATE_CORRECTION
     assert abs(MTP6_HIT_RATE_CORRECTION - 7 / 12) < 1e-12

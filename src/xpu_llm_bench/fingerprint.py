@@ -169,3 +169,78 @@ def fingerprint_from_inspect(
     lh.update(json.dumps({"cmd": fp.cmd, "env": sorted(fp.env)}, sort_keys=True).encode())
     fp.launch_fingerprint = lh.hexdigest()
     return fp
+
+
+# ---------------------------------------------------------------------------
+# Expected-vs-actual launch check (env / launch_args / image are expectations
+# about the container the operator booted; they are verified, never applied).
+# ---------------------------------------------------------------------------
+
+
+def _cmd_tokens(cmd: list[str]) -> list[str]:
+    out: list[str] = []
+    for item in cmd:
+        if " " in item:
+            try:
+                out.extend(shlex.split(item))
+            except ValueError:
+                out.extend(item.split())
+        else:
+            out.append(item)
+    return out
+
+
+def _arg_present(tokens: list[str], flag: str, value: str | None) -> bool:
+    if value is None:
+        if flag in tokens:
+            return True
+        if "=" in flag:
+            f, _, v = flag.partition("=")
+            return any(tokens[i] == f and tokens[i + 1] == v for i in range(len(tokens) - 1))
+        return False
+    if f"{flag}={value}" in tokens:
+        return True
+    return any(tokens[i] == flag and tokens[i + 1] == value for i in range(len(tokens) - 1))
+
+
+def verify_expected(
+    fp: Fingerprint,
+    env: dict[str, str],
+    launch_args: list[str],
+    image: str | None = None,
+    image_digest: str | None = None,
+    is_placeholder=lambda v: False,
+) -> list[str]:
+    """Mismatches between what the spec says the container runs and docker inspect."""
+    problems: list[str] = []
+    actual: dict[str, str] = {}
+    for item in fp.env:
+        k, _, v = item.partition("=")
+        actual[k] = v
+    for key, want in (env or {}).items():
+        if key not in actual:
+            problems.append(f"env {key}={want!r} expected, but {key} is not set in container {fp.container}")
+        elif actual[key] == "<redacted>":
+            continue
+        elif actual[key] != str(want):
+            problems.append(f"env {key}: expected {want!r}, container has {actual[key]!r}")
+    tokens = _cmd_tokens(fp.cmd)
+    args = list(launch_args or [])
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        val = None
+        if tok.startswith("-") and "=" not in tok and i + 1 < len(args) and not args[i + 1].startswith("-"):
+            val = args[i + 1]
+            i += 1
+        if not _arg_present(tokens, tok, val):
+            shown = tok if val is None else f"{tok} {val}"
+            problems.append(f"launch arg {shown!r} expected, not found in the container command")
+        i += 1
+    if image and not is_placeholder(image) and fp.image_tag and image != fp.image_tag:
+        problems.append(f"image: expected {image!r}, container runs {fp.image_tag!r}")
+    if image_digest and not is_placeholder(image_digest):
+        known = [fp.image_id or ""] + list(fp.repo_digests)
+        if not any(image_digest in d for d in known if d):
+            problems.append(f"image digest {image_digest!r} not found in the container's image id / repo digests")
+    return problems

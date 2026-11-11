@@ -55,18 +55,38 @@ mode.
 | window | 96 tokens | 256 tokens |
 
 `bench plan` prints the order, per-session contexts, a wall-time estimate
-from `planner.assumed_*` (not measured), and a KV / RAM sketch.
+from `planner.assumed_*` (not measured), and a GPU / host-RAM feasibility
+check, and exits 1 when the plan cannot fit:
+- GPU: weights + KV(peak live tokens) + device overhead against
+  `gpu_count × gpu_mem_gib` (FAIL above 95%, WARN above 85%).
+- Host: server-process RAM plus any host-resident KV share
+  (`planner.host_kv_fraction`) against `host_ram_gib` minus the
+  MemAvailable floor (FAIL if over, WARN within 2 GiB). The process RAM is
+  measured RSS when available (`bench plan --measured results.jsonl`, and a
+  live run re-checks with the server's RSS at preflight), otherwise the
+  `planner.assumed_host_process_gib` ESTIMATE.
 
 **Resume.** After each rung the runner saves `manifest.json` (with
-`completed_rung_ids`) and `sessions.json` (every conversation verbatim).
-`bench run --resume` reloads both and re-prefills each live session to its
+`completed_rung_ids`) and `sessions.json` (a compact record of every
+conversation: each user turn as its corpus segment index, length and a
+SHA-256, regenerated from the seeded corpus on load; the model's replies
+verbatim). `bench run --resume` reloads both (refusing if a regenerated turn
+does not match its hash) and re-prefills each live session to its
 high-water context **outside** any window. Sessions are never rebuilt
 smaller. If the container's `StartedAt` changed, the first resumed rung is
 flagged `RESUMED_REFILL`.
 
-The old scaffold order (`shape: grid`: all concurrencies at 8K, then grow
-everyone and quiesce down) is still available. Grid rows carry
-`phase=meas` and are never compared with S/C rows.
+The progressive ladder is the default for every profile, including
+`custom`. The old scaffold order (`shape: grid`: all concurrencies at 8K,
+then grow everyone and quiesce down) is refused unless the spec also sets
+`allow_grid: true`; `bench plan` and `bench run` then print a loud warning.
+Grid rows carry `phase=meas` and are never compared with S/C rows.
+
+**Dry run.** `--dry-run` writes only under `<out>/<spec>/dry-run/`: a
+manifest with `status: dry_run` and `planned_rung_ids` (never
+`completed_rung_ids`), `DRY_RUN` placeholder rows, and no `sessions.json`.
+`--resume` ignores a `dry_run` manifest. The safety commands a live run
+would execute are printed to stdout.
 
 ## 2. Workload
 
@@ -213,13 +233,15 @@ Any failure → `QUALITY_FAIL`.
 
 ## 8. Reporting and comparison
 
-`bench report <results.jsonl>` writes one markdown file: header (fingerprint,
+`bench report <results.jsonl | run dir>` prints markdown to stdout
+(`--output FILE` writes it to a file instead): header (fingerprint,
 boot evidence, hold), quoted evidence lines, **one table** with steps/s next
 to tok/s, flags legend. `--csv` writes every column. The column order is
 fixed (`report.COLUMNS`).
 
-`bench compare A B` pairs rows on (users, ctx, prompt type, load mode,
-phase). It is NON-COMPARABLE if any of these differ:
+`bench compare A B` pairs rows on (users, ctx, prompt type); repeated keys
+within one run (e.g. two load modes) stay separate pairs in order. A pair
+is NON-COMPARABLE if load mode or ladder phase differ, or if any of these differ:
 - k (compare steps/s, not hit rate)
 - seed
 - temperature
@@ -234,8 +256,20 @@ S-131K, C-2u and C-4u.
 ## 9. Legacy rows
 
 `bench import-legacy` maps old JSONL into this schema with the `CONVERTED`
-flag (never headline). The old summed ratio 2A/((k+1)D) converts to A/(kD)
-with `--correct-summed-ratio K` (factor (k+1)/(2k), 7/12 for k=6;
+flag (never headline). It reads scaffold-era rows (users, ctx, tok/s, acc)
+and speed-fix ladder rows (`prompt_tokens`, `rates`, `total_toks`,
+`per_user_steps_s`, `first_token_s`, `mem.min_kb`, `tokens_per_step`,
+`drafts_delta`, `draft_tokens_delta`, `accepted_tokens_delta`). Users come
+from `prompt_tokens`, the rung context from the label (`...-8192`), phase
+from the label (`join` → C, `start` → S).
+
+`hit_rate` is derived as `(tokens_per_step − 1) / k` with k =
+draft_tokens/drafts (or from delivered tokens and drafts). It is **never**
+copied from the acceptance counter: counter values go to
+`acceptance_rate_vllm`, and a row with nothing to derive from gets an
+empty `hit_rate` and `HIT_RATE_UNKNOWN`. The old summed ratio
+2A/((k+1)D) converts to A/(kD) in `acceptance_rate_vllm` with
+`--correct-summed-ratio K` (factor (k+1)/(2k), 7/12 for k=6;
 `--correct-mtp6-hit-rate` is the k=6 shortcut). `--port N` (or a legacy
 URL) on a protected production port adds `PROTECTED_PORT`.
 
