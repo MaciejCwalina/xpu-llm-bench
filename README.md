@@ -83,6 +83,7 @@ test container; the harness measures it and checks it is what the spec says.
    bench run my-spec.yaml --dry-run      # plan + the exact safety commands; writes only <out>/<spec>/dry-run/
    bench run my-spec.yaml --output-dir results
    bench report results/<spec-name>      # markdown on stdout
+   bench report results/<spec-name> --html   # self-contained report.html with charts
    ```
 
 ### A/B specs (variants)
@@ -161,6 +162,12 @@ bench run my-qsa-vs-dense.yaml --variant dense --output-dir results
 bench report results/my-qsa-full-fix
 bench compare results/qsa-vs-dense__dense/results.jsonl results/qsa-vs-dense__qsa/results.jsonl
 
+# HTML report with charts (also written automatically as report.html at the end
+# of every real run; --no-html skips it). --html-out picks the path:
+bench report results/my-qsa-full-fix --html --html-out /tmp/report.html
+# A/B overlay: first run solid, the others dashed:
+bench compare results/qsa-vs-dense__dense results/qsa-vs-dense__qsa --html /tmp/ab.html
+
 # Older rung JSONL (scaffold rows or speed-fix ladder-rungs.jsonl):
 # --attention-path records what the old run used as DECLARED, not proven:
 bench import-legacy old.jsonl results/imported.jsonl --prompt-type code_edits --attention-path qsa
@@ -174,6 +181,31 @@ pytest
 ```
 
 ## What a run records
+
+Every run directory describes itself:
+- `launch.json` and the header of `run.log`: how the server was started, captured
+  read-only at preflight with UTC and local timestamps. From `docker inspect` of the
+  test container (entrypoint, cmd, args, env, image + digest, devices, ports, IPC /
+  shm), or the server's command line from `ps` when it is not in a container, plus
+  vLLM's own boot-log "non-default args" / engine-config lines. Secret-looking values
+  (`*_TOKEN`, `*_KEY`, `*SECRET*`, `*PASSWORD*`, `--api-key X`, token-shaped strings)
+  are redacted. The same record is in `manifest.json` → `launch`. Nothing is started,
+  stopped or restarted to get it.
+- `run.log`: that header, then one line per rung and the final status.
+- `report.html`: one self-contained file (inline SVG drawn by the harness: no
+  scripts, no CDN, no network assets; opens offline; follows the system light/dark
+  setting). For decode tok/s, prefill tok/s, TTFT, verify steps/s, accepted drafts
+  per step and true hit rate it draws one chart per prompt type and load mode:
+  X = context per user (ladder order), Y = the metric, one line per concurrency
+  (users), so you see the family of curves as both grow. Hover a point for the exact
+  value. Flagged rows (`NOT_AS_LABELED`, `QSA_FALLBACK`, `GRAPH_MISS`,
+  `HIT_RATE_UNKNOWN`, ...) and invalid rows are drawn hollow and list their flags.
+  The spec-decode charts are replaced by a note when the run has no speculative
+  decoding. A header shows the run fingerprint (image, attention path from logs, KV
+  format, graphs and capture sizes, spec method and k, hardware, timestamps, the
+  captured start command) and caveats; a full numbers table follows the charts.
+  `python scripts/make_example_report.py out.html` renders an example from
+  synthetic data.
 
 **Headline speed is verify steps/s per user, shown next to decode tok/s.**
 The true hit rate is `(delivered − verify_steps) / (k × verify_steps)`, with k

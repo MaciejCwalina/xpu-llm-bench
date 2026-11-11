@@ -293,6 +293,9 @@ class RunManifest(BaseModel):
     corpus_files: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
     hold: dict[str, Any] = Field(default_factory=dict)
     first_greedy_divergence: dict[str, Any] | None = None
+    # Server start command and settings captured read-only at preflight
+    # (docker inspect / ps / vLLM boot log), secrets redacted. Also in launch.json.
+    launch: dict[str, Any] = Field(default_factory=dict)
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(

@@ -543,6 +543,11 @@
           "default": null,
           "title": "Kv Format"
         },
+        "launch": {
+          "additionalProperties": true,
+          "title": "Launch",
+          "type": "object"
+        },
         "launch_check": {
           "additionalProperties": true,
           "title": "Launch Check",

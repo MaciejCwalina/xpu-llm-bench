@@ -1,0 +1,145 @@
+{
+  "run_id": "example-synthetic-20260101T000000Z",
+  "spec_name": "example-synthetic",
+  "spec_path": null,
+  "profile": "full",
+  "tool_version": "0.1.0",
+  "started_utc": "2026-01-01T00:00:45+00:00",
+  "started_local": "2026-01-01T00:00:45+00:00",
+  "finished_utc": "2026-01-01T01:10:00+00:00",
+  "finished_local": "2026-01-01T01:10:00+00:00",
+  "display_timezone": "UTC",
+  "status": "completed",
+  "abort_reason": null,
+  "planned_rung_ids": [],
+  "site_config": null,
+  "launch_check": {},
+  "image": "example-registry/vllm-xpu:example",
+  "image_digest": null,
+  "server_source_commit": null,
+  "hardware": {
+    "host": "example-host",
+    "gpu_model": "example GPU",
+    "gpu_count": 2,
+    "tensor_parallel": 2,
+    "driver": null,
+    "oneapi": null,
+    "host_ram_gib": null,
+    "mem_available_floor_gib": 2.0
+  },
+  "config": {},
+  "attention": {
+    "requested": "qsa",
+    "actual": "qsa",
+    "evidence_lines": [
+      "(synthetic) attention backend line from the boot log"
+    ]
+  },
+  "kv_format": "example_kv",
+  "graph": {
+    "mode": "FULL_DECODE_ONLY",
+    "per_gpu": false,
+    "capture_sizes": [
+      8,
+      16,
+      32,
+      64
+    ],
+    "graphs_on": true,
+    "graphs_basis": "boot_log",
+    "graphs_declared": true,
+    "eager_fallback": false
+  },
+  "speculative": {
+    "method": "mtp",
+    "num_speculative_tokens": 6,
+    "dflash_k": null
+  },
+  "decode_method": null,
+  "completed_rung_ids": [],
+  "output_jsonl": null,
+  "notes": [
+    "SYNTHETIC example data: illustrates the report layout only."
+  ],
+  "prompt_seed": 20260101,
+  "k": 6,
+  "fingerprint": {
+    "container": "vllm-bench-example",
+    "image_tag": "example-registry/vllm-xpu:example",
+    "build_fingerprint": "synthetic-example-fingerprint"
+  },
+  "boot": {},
+  "host": {},
+  "corpus_files": {},
+  "hold": {},
+  "first_greedy_divergence": null,
+  "launch": {
+    "captured_utc": "2026-01-01T00:00:45+00:00",
+    "captured_local": "2026-01-01T00:00:45+00:00",
+    "display_timezone": "UTC",
+    "endpoint": "http://127.0.0.1:8102/v1",
+    "source": "docker_inspect",
+    "container": "vllm-bench-example",
+    "image": "example-registry/vllm-xpu:example",
+    "image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+    "repo_digests": [],
+    "entrypoint": [
+      "/opt/example/entrypoint.sh"
+    ],
+    "cmd": [
+      "vllm",
+      "serve",
+      "/models/target",
+      "--served-model-name",
+      "example-model",
+      "--tensor-parallel-size",
+      "2",
+      "--kv-cache-dtype",
+      "example_kv",
+      "--speculative-config",
+      "{\"method\": \"mtp\", \"num_speculative_tokens\": 6}",
+      "--api-key",
+      "<redacted>",
+      "--hf-token=<redacted>",
+      "--port",
+      "8102"
+    ],
+    "args": [
+      "vllm",
+      "serve",
+      "/models/target",
+      "--port",
+      "8102"
+    ],
+    "command_line": "/opt/example/entrypoint.sh vllm serve /models/target --served-model-name example-model --tensor-parallel-size 2 --kv-cache-dtype example_kv --speculative-config '{\"method\": \"mtp\", \"num_speculative_tokens\": 6}' --api-key '<redacted>' '--hf-token=<redacted>' --port 8102",
+    "env": {
+      "PATH": "/usr/local/bin:/usr/bin:/bin",
+      "EXAMPLE_FEATURE_FLAG": "1",
+      "HF_TOKEN": "<redacted>",
+      "VLLM_API_KEY": "<redacted>",
+      "DB_PASSWORD": "<redacted>",
+      "NUM_SPECULATIVE_TOKENS": "6"
+    },
+    "devices": [
+      "/dev/dri:/dev/dri"
+    ],
+    "group_add": [
+      "render"
+    ],
+    "ipc_mode": "host",
+    "shm_size": 17179869184,
+    "network_mode": "bridge",
+    "port_bindings": [
+      "127.0.0.1:8102->8102/tcp"
+    ],
+    "restart_policy": "no",
+    "container_started_at": "2026-01-01T00:00:00.000000000Z",
+    "vllm_boot_config": [
+      "2026-01-01T00:00:01Z INFO 01-01 00:00:01 [api_server.py:100] vLLM API server version 0.0.0-example",
+      "2026-01-01T00:00:01Z INFO 01-01 00:00:01 [utils.py:200] non-default args: {'model': '/models/target', 'served_model_name': ['example-model'], 'tensor_parallel_size': 2, 'kv_cache_dtype': 'example_kv', 'api_key': '<redacted>', 'hf_token': None, 'num_speculative_tokens': 6, 'tokenizer': '/models/target'}",
+      "2026-01-01T00:00:02Z INFO 01-01 00:00:02 [core.py:300] Initializing a V1 LLM engine (v0.0.0-example) with config: model='/models/target', speculative_config=SpeculativeConfig(method='mtp', num_spec_tokens=6), max_model_len=131072, hf_token=<redacted>"
+    ],
+    "problems": [],
+    "read_only": true
+  }
+}

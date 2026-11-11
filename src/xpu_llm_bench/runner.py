@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from xpu_llm_bench import bootlog, hostinfo, procmem
+from xpu_llm_bench import bootlog, hostinfo, launch, procmem
 from xpu_llm_bench.client import OpenAICompatClient, StreamResult
 from xpu_llm_bench.container import ContainerAdapter
 from xpu_llm_bench.fingerprint import Fingerprint, collect_fingerprint, verify_expected
@@ -73,6 +73,7 @@ from xpu_llm_bench.results import (
     RunManifest,
     SpecDecodeSnapshot,
     local_tz_name,
+    read_jsonl,
     stamp_pair,
     write_jsonl_row,
 )
@@ -374,6 +375,8 @@ class Runner:
         ram_wait_min: float = 0.0,
         no_site_config: bool = False,
         require_container: bool = True,
+        html: bool = True,
+        ps_fn: Callable[[], str] | None = None,
     ):
         self.spec = spec
         # Dry runs never share a directory (or a manifest) with a real run.
@@ -417,6 +420,8 @@ class Runner:
         self._fingerprint_fn = fingerprint_fn
         self._proc_fn = proc_fn
         self._host_fn = host_fn
+        self.html = html
+        self._ps_fn = ps_fn
         self.ram_wait_min = ram_wait_min
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.k_declared = spec.server.speculative.k
@@ -480,6 +485,61 @@ class Runner:
             return hostinfo.collect(self.exec)
         except Exception as exc:  # noqa: BLE001
             return {"error": repr(exc)}
+
+    def _runlog(self, line: str) -> None:
+        """Append one timestamped line to run.log (the launch header is at its top)."""
+        if self.dry_run:
+            return
+        _utc, local = stamp_pair()
+        with (self.output_dir / "run.log").open("a", encoding="utf-8") as fh:
+            fh.write(f"{local}  {line}\n")
+
+    def _server_argv(self) -> list[str] | None:
+        """Command line of a non-container vLLM server (read-only ``ps``)."""
+        from urllib.parse import urlsplit
+
+        try:
+            text = self._ps_fn() if self._ps_fn else self.exec.run(["ps", "-eo", "pid=,args="], timeout=15).stdout
+        except Exception:  # noqa: BLE001
+            return None
+        return launch.find_server_process(text or "", urlsplit(self.spec.endpoint.base_url).port)
+
+    def _capture_launch(self, manifest: RunManifest, log_text: str | None) -> None:
+        """Record how the server was started: launch.json, run.log header, manifest.launch.
+
+        Read-only: docker inspect (already done for the fingerprint), ps, docker logs.
+        Nothing is started, stopped or restarted.
+        """
+        fp = self.fp
+        rec = launch.capture(
+            process_argv=None if (fp and fp.launch) else self._server_argv(),
+            boot_log=log_text,
+            endpoint=self.spec.endpoint.base_url,
+            problems=list(fp.problems) if fp else [],
+        )
+        if fp and fp.launch:
+            head = {k: rec[k] for k in ("captured_utc", "captured_local", "display_timezone", "endpoint")}
+            tail = {k: rec[k] for k in ("vllm_boot_config", "problems", "read_only")}
+            rec = {**head, **fp.launch, **tail}
+        manifest.launch = rec
+        (self.output_dir / "launch.json").write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
+        log = self.output_dir / "run.log"
+        mode = "a" if (self.resume and log.exists()) else "w"
+        with log.open(mode, encoding="utf-8") as fh:
+            if mode == "a":
+                fh.write("\n--- RESUME: launch re-captured ---\n")
+            fh.write(launch.header_text(rec, f"run {manifest.run_id} ({manifest.spec_name})"))
+
+    def _write_html(self, manifest: RunManifest) -> None:
+        from xpu_llm_bench.html_report import render_html
+
+        jsonl = self.output_dir / "results.jsonl"
+        try:
+            rows = read_jsonl(jsonl) if jsonl.exists() else []
+            (self.output_dir / "report.html").write_text(render_html(rows, manifest), encoding="utf-8")
+            self._runlog(f"wrote {self.output_dir / 'report.html'}")
+        except Exception as exc:  # noqa: BLE001  (a report must never fail the run)
+            self._runlog(f"report.html not written: {exc!r}")
 
     def _write_manifest(self, manifest: RunManifest) -> None:
         manifest.save(self.output_dir / "manifest.json")
@@ -1178,10 +1238,13 @@ class Runner:
         self.preflight_warnings = warnings
         if problems:
             raise RunRefused("\n".join(problems), manifest)
+        log_text: str | None = None
         try:
-            self.boot = bootlog.parse_boot(self._logs_text(tail=200000), self.spec.log_patterns)
+            log_text = self._logs_text(tail=200000)
+            self.boot = bootlog.parse_boot(log_text, self.spec.log_patterns)
         except Exception:  # noqa: BLE001
             self.boot = None
+        self._capture_launch(manifest, log_text)
         if self.boot:
             manifest.boot = self.boot.summary()
             if manifest.graph is not None and self.boot.graphs_on is not None:
@@ -1344,6 +1407,10 @@ class Runner:
                         ram_floor=True, mem_min=watcher.min_gib(),
                     )
                 write_jsonl_row(jsonl, row)
+                self._runlog(
+                    f"rung {row.rung_id} valid={row.valid} decode_tok_s_per_user={row.decode_tok_s_per_user} "
+                    f"exit={row.exit_reason} flags={','.join(row.flags) or '-'}"
+                )
                 if self.dry_run:
                     # Dry runs record what would run; nothing is completed or resumable.
                     manifest.planned_rung_ids.append(rung.rung_id)
@@ -1378,6 +1445,9 @@ class Runner:
         else:
             manifest.status = "completed"
         self._write_manifest(manifest)
+        self._runlog(f"run {manifest.status}" + (f": {manifest.abort_reason}" if manifest.abort_reason else ""))
+        if self.html and not self.dry_run:
+            self._write_html(manifest)
         return manifest
 
     def _read_remote(self, path: str) -> str | None:

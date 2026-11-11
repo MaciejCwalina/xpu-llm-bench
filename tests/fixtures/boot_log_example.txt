@@ -1,0 +1,4 @@
+2026-01-01T00:00:01Z INFO 01-01 00:00:01 [api_server.py:100] vLLM API server version 0.0.0-example
+2026-01-01T00:00:01Z INFO 01-01 00:00:01 [utils.py:200] non-default args: {'model': '/models/target', 'served_model_name': ['example-model'], 'tensor_parallel_size': 2, 'kv_cache_dtype': 'example_kv', 'api_key': 'not-a-real-key-0006', 'hf_token': None, 'num_speculative_tokens': 6, 'tokenizer': '/models/target'}
+2026-01-01T00:00:02Z INFO 01-01 00:00:02 [core.py:300] Initializing a V1 LLM engine (v0.0.0-example) with config: model='/models/target', speculative_config=SpeculativeConfig(method='mtp', num_spec_tokens=6), max_model_len=131072, hf_token=hf_notarealtokenabcdefghij
+2026-01-01T00:00:30Z INFO 01-01 00:00:30 [api_server.py:400] Starting vLLM API server on http://0.0.0.0:8102

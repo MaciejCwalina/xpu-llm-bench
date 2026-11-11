@@ -4,6 +4,9 @@ A run writes these files under `--output-dir/<spec-name>/`:
 
 - `manifest.json`: identity, fingerprint, boot evidence, host facts, hold state, and `completed_rung_ids` (the resume cursor).
 - `results.jsonl`: one JSON object per measured rung, in schedule order.
+- `launch.json`: the server's start command and settings, captured read-only at preflight (also `manifest.launch`). Fields: `captured_utc`, `captured_local`, `display_timezone`, `endpoint`, `source` (`docker_inspect` / `process_cmdline` / `none`), `container`, `image`, `image_id`, `repo_digests`, `entrypoint`, `cmd`, `args`, `command_line`, `env` (name → value, secrets `<redacted>`), `devices`, `group_add`, `ipc_mode`, `shm_size`, `network_mode`, `port_bindings`, `restart_policy`, `container_started_at`, `vllm_boot_config` (vLLM's "non-default args" / engine-config log lines, redacted), `problems`, `read_only`.
+- `run.log`: human-readable launch header (UTC and local time), then one line per rung and the final status.
+- `report.html`: self-contained HTML report with inline SVG charts (`bench report --html`; written at the end of every real run unless `--no-html`).
 - `sessions.json`: a compact record of every live conversation, used by `--resume` to re-prefill: user turns as (segment, n_chars, opener, sha256), regenerated from the seeded corpus on load; model replies verbatim. Never edit it. Not written by `--dry-run`.
 - `dry-run/`: a `--dry-run` writes its own `manifest.json` (`status: dry_run`, `planned_rung_ids`) and `DRY_RUN` rows here, never next to a real run.
 - `greedy_outputs.jsonl`: greedy window outputs (`probe_id`, token ids, text). This is the MTP on/off reference.
@@ -31,6 +34,7 @@ fails if it drifts. Every timestamp is recorded twice: UTC (`*_utc`) and the dis
 | `boot` | Parsed boot evidence (attention_boot, QSA_WRAP / QSA_MEMORY_PLAN / banner, graphs, capture sizes, KV dtype and tokens, speculative config) |
 | `host` | sysfs GPU ids/driver, kernel, oneAPI / level-zero package versions (no xpu-smi) |
 | `hold` | bench-hold status before, our acquire, status after, release (`{"skipped": ...}` when no `hold_command` is configured). The default hold name is the run id (`<spec name>-<utc stamp>-…`), so copies of a spec never share a hold. |
+| `launch` | Server start command and settings captured read-only at preflight (same as `launch.json`; secrets redacted). |
 | `graph` | `graphs_declared` (from the spec's graph mode, or null), `graphs_on` (true/false only from boot-log evidence, else null) and `graphs_basis` (`boot_log` / `unknown`). Dry runs never claim graphs on. |
 | `corpus_files` | sha256 of each corpus file when `prompts.corpus_dir` is used |
 | `first_greedy_divergence` | First probe and token where MTP-on output left the reference |

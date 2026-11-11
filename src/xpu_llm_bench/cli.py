@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from xpu_llm_bench import __version__
+from xpu_llm_bench.html_report import render_html
 from xpu_llm_bench.import_legacy import import_legacy_file
 from xpu_llm_bench.planner import (
     GRID_WARNING,
@@ -29,6 +30,10 @@ from xpu_llm_bench.runner import RunRefused, run_spec
 from xpu_llm_bench.safety import SafetyError
 from xpu_llm_bench.site import SiteConfigError, describe_site
 from xpu_llm_bench.spec import load_spec
+
+
+def _run_label(path: Path) -> str:
+    return path.parent.name if path.name == "results.jsonl" else path.stem
 
 
 def _add_profile(p: argparse.ArgumentParser) -> None:
@@ -86,6 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Acknowledge running without a site config (only built-in neutral protection applies)",
     )
     run.add_argument("--variant", default=None, help="Run only this variant (boot its container first)")
+    run.add_argument("--no-html", action="store_true", help="Do not write report.html at the end of the run")
     run.add_argument(
         "--pause-between-variants",
         action="store_true",
@@ -100,10 +106,19 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--csv", type=Path, default=None, help="Write every column as CSV")
     report.add_argument("--output", type=Path, default=None, help="Write the markdown here instead of stdout")
     report.add_argument("--wide", action="store_true", help="Markdown table with every column")
+    report.add_argument(
+        "--html",
+        action="store_true",
+        help="Write a self-contained HTML report with SVG charts (default: report.html beside the results)",
+    )
+    report.add_argument("--html-out", type=Path, default=None, help="Path for the HTML report (implies --html)")
 
     compare = sub.add_parser("compare", help="Compare two or more runs; flag non-comparable rows")
-    compare.add_argument("runs", nargs="+", type=Path, help="results.jsonl files, A B [C...]")
+    compare.add_argument("runs", nargs="+", type=Path, help="results.jsonl files (or run dirs), A B [C...]")
     compare.add_argument("--output", type=Path, default=None)
+    compare.add_argument(
+        "--html", type=Path, default=None, help="Also write an HTML overlay: A solid, the others dashed"
+    )
 
     imp = sub.add_parser("import-legacy", help="Convert older ad-hoc rung JSONL into the current schema")
     imp.add_argument("src", type=Path)
@@ -188,6 +203,7 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             no_site_config=args.no_site_config,
             variant=args.variant,
             pause_between_variants=args.pause_between_variants,
+            html=not args.no_html,
         )
         for man in manifests:
             if man.status == "dry_run":
@@ -212,6 +228,12 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         rows = load_run(run_path)
         man_path = run_path.parent / "manifest.json"
         manifest = RunManifest.load(man_path) if man_path.exists() else None
+        if args.html or args.html_out:
+            out_html = args.html_out or run_path.parent / "report.html"
+            out_html.write_text(render_html(rows, manifest), encoding="utf-8")
+            print(f"wrote {out_html}", file=sys.stderr)
+            if not (args.output or args.csv):
+                return 0
         md = rows_to_markdown(rows, COLUMNS) if args.wide else run_report(rows, manifest)
         if args.output:
             args.output.write_text(md, encoding="utf-8")
@@ -226,6 +248,8 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         if len(args.runs) < 2:
             parser.error("compare needs at least two run files")
         texts = []
+        paths = [r / "results.jsonl" if r.is_dir() else r for r in args.runs]
+        args.runs = paths
         base = load_run(args.runs[0])
         for other in args.runs[1:]:
             texts.append(
@@ -236,6 +260,20 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
                 )
             )
         out = "\n".join(texts)
+        if args.html:
+            man_path = paths[0].parent / "manifest.json"
+            man0 = RunManifest.load(man_path) if man_path.exists() else None
+            others = [(_run_label(p), load_run(p)) for p in paths[1:]]
+            args.html.write_text(
+                render_html(
+                    base,
+                    man0,
+                    title=f"xpu-llm-bench compare — {_run_label(paths[0])} vs " + ", ".join(lab for lab, _ in others),
+                    compare=others,
+                ),
+                encoding="utf-8",
+            )
+            print(f"wrote {args.html}", file=sys.stderr)
         if args.output:
             args.output.write_text(out, encoding="utf-8")
         else:

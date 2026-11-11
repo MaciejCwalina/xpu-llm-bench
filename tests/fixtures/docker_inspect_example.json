@@ -1,0 +1,44 @@
+[
+  {
+    "Id": "0000000000000000000000000000000000000000000000000000000000000001",
+    "Name": "/vllm-bench-example",
+    "Image": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+    "Args": ["vllm", "serve", "/models/target", "--port", "8102"],
+    "State": {"Status": "running", "StartedAt": "2026-01-01T00:00:00.000000000Z", "OOMKilled": false},
+    "Config": {
+      "Image": "example-registry/vllm-xpu:example",
+      "Entrypoint": ["/opt/example/entrypoint.sh"],
+      "Cmd": [
+        "vllm", "serve", "/models/target",
+        "--served-model-name", "example-model",
+        "--tensor-parallel-size", "2",
+        "--kv-cache-dtype", "example_kv",
+        "--speculative-config", "{\"method\": \"mtp\", \"num_speculative_tokens\": 6}",
+        "--api-key", "not-a-real-key-0001",
+        "--hf-token=not-a-real-token-0002",
+        "--port", "8102"
+      ],
+      "Env": [
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "EXAMPLE_FEATURE_FLAG=1",
+        "HF_TOKEN=not-a-real-token-0003",
+        "VLLM_API_KEY=not-a-real-key-0004",
+        "DB_PASSWORD=not-a-real-password-0005",
+        "NUM_SPECULATIVE_TOKENS=6"
+      ]
+    },
+    "HostConfig": {
+      "Devices": [{"PathOnHost": "/dev/dri", "PathInContainer": "/dev/dri", "CgroupPermissions": "rwm"}],
+      "GroupAdd": ["render"],
+      "IpcMode": "host",
+      "ShmSize": 17179869184,
+      "NetworkMode": "bridge",
+      "PortBindings": {"8102/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8102"}]},
+      "RestartPolicy": {"Name": "no"}
+    },
+    "RepoDigests": [],
+    "Mounts": [
+      {"Type": "bind", "Source": "/srv/models/example-model", "Destination": "/models/target"}
+    ]
+  }
+]

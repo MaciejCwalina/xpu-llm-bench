@@ -47,6 +47,8 @@ class Fingerprint:
     oom_killed: bool | None = None
     state_status: str | None = None
     problems: list[str] = field(default_factory=list)
+    # Redacted start command and settings (xpu_llm_bench.launch); not hashed.
+    launch: dict[str, Any] | None = None
 
     def short(self) -> str | None:
         return self.build_fingerprint[:12] if self.build_fingerprint else None
@@ -128,6 +130,7 @@ def fingerprint_from_inspect(
     info: dict[str, Any],
     skip_content_dest: tuple[str, ...] = DEFAULT_SKIP_CONTENT,
 ) -> Fingerprint:
+    from xpu_llm_bench.launch import launch_from_inspect, redact_argv
     from xpu_llm_bench.safety import bound_host_ports
 
     cfg = info.get("Config") or {}
@@ -139,12 +142,15 @@ def fingerprint_from_inspect(
         image_id=info.get("Image"),
         repo_digests=list(info.get("RepoDigests") or []),
         started_at=state.get("StartedAt"),
-        cmd=list(cfg.get("Cmd") or []) + list(info.get("Args") or []),
+        # Secret-looking flag values (--api-key X, --hf-token=X) are redacted.
+        cmd=redact_argv(list(cfg.get("Cmd") or []) + list(info.get("Args") or [])),
         env=redact_env(list(cfg.get("Env") or [])),
         oom_killed=state.get("OOMKilled"),
         state_status=state.get("Status"),
     )
     fp.host_ports = sorted(bound_host_ports(info))
+
+    fp.launch = launch_from_inspect(info, container)
     if not fp.repo_digests:
         fp.problems.append("local image: no RepoDigest; image ID + mount hashes identify the build")
     for m in sorted(info.get("Mounts") or [], key=lambda x: x.get("Destination", "")):
