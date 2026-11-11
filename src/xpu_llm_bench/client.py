@@ -84,7 +84,7 @@ class OpenAICompatClient:
             return 0, repr(exc)
 
     def get_text(self, url: str, timeout: float | None = None) -> tuple[int, str]:
-        return self.request_json("GET", url, None, timeout=timeout or 15.0)
+        return self.request_json("GET", url, None, timeout=timeout or 60.0)
 
     def chat_stream(
         self,

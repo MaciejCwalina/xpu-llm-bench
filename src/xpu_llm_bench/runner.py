@@ -306,6 +306,10 @@ class Session:
 # ---------------------------------------------------------------------------
 
 
+METRICS_FETCH_ATTEMPTS = 4
+METRICS_RETRY_BASE_S = 1.0
+
+
 @dataclass
 class WindowSamples:
     running: list[float] = field(default_factory=list)
@@ -557,10 +561,17 @@ class Runner:
     def _metrics_text(self) -> str:
         if self.fetch_metrics:
             return self.fetch_metrics()
-        status, body = self.client.get_text(self.spec.endpoint.metrics_url)
-        if status != 200:
-            raise RuntimeError(f"/metrics returned {status}")
-        return body
+        # A busy server (e.g. several long prefills at once) can answer /metrics late; one slow or
+        # dropped scrape should not abort a whole run, so retry with backoff before giving up.
+        error = ""
+        for attempt in range(METRICS_FETCH_ATTEMPTS):
+            status, body = self.client.get_text(self.spec.endpoint.metrics_url)
+            if status == 200:
+                return body
+            error = f"/metrics returned {status}" + (f" ({body[:200]})" if status == 0 else "")
+            if attempt + 1 < METRICS_FETCH_ATTEMPTS:
+                time.sleep(METRICS_RETRY_BASE_S * 2**attempt)
+        raise RuntimeError(f"{error} after {METRICS_FETCH_ATTEMPTS} attempts")
 
     def _logs_text(self, tail: int = 4000) -> str:
         if self.fetch_logs:
