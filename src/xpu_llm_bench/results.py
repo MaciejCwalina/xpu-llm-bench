@@ -51,6 +51,7 @@ FLAGS: dict[str, str] = {
     "CLIENT_ERROR": "Request failed without a server-side cause in the logs.",
     "REBOOTED": "Container StartedAt changed mid-run (boot-once violated).",
     "RESUMED_REFILL": "First rung after --resume on a new boot: sessions were re-prefilled.",
+    "REPEAT_FAILED": "One of the repeated decode windows (ladder.repeats) failed; it is left out of the median / min / max.",
     "QUALITY_FAIL": "A quality check failed on this rung (see quality fields).",
     "CONVERTED": "Value converted from a legacy definition (import-legacy).",
     "HIT_RATE_UNKNOWN": "Imported row: no tokens_per_step / drafts to derive the true hit rate; hit_rate left empty (the acceptance counter is never used as hit_rate).",
@@ -160,6 +161,45 @@ class QualityResult(BaseModel):
     logprob_scores: dict[str, float] = Field(default_factory=dict)
 
 
+# Metrics re-measured per repeat (ladder.repeats). The row's own field holds the
+# median across repeats; repeat_stats keeps every value plus min/max/stdev.
+REPEAT_METRICS: tuple[str, ...] = (
+    "decode_tok_s_per_user",
+    "steps_s_per_user",
+    "accepted_drafts_per_step",
+    "hit_rate",
+    "ttft_ms",
+    "prefill_tok_s",
+)
+
+
+class RepeatStat(BaseModel):
+    """One metric across the repeated decode windows of a rung."""
+
+    values: list[float | None] = Field(default_factory=list)  # per repeat, in order
+    n: int = 0  # repeats with a value
+    median: float | None = None
+    min: float | None = None
+    max: float | None = None
+    stdev: float | None = None  # sample stdev; only when n >= 3
+
+
+def repeat_stat(values: list[float | None]) -> RepeatStat:
+    import statistics
+
+    xs = [float(v) for v in values if v is not None]
+    if not xs:
+        return RepeatStat(values=list(values), n=0)
+    return RepeatStat(
+        values=list(values),
+        n=len(xs),
+        median=statistics.median(xs),
+        min=min(xs),
+        max=max(xs),
+        stdev=statistics.stdev(xs) if len(xs) >= 3 else None,
+    )
+
+
 class RungResult(BaseModel):
     run_id: str
     rung_id: str
@@ -241,6 +281,11 @@ class RungResult(BaseModel):
     exit_reason: str | None = None  # RAM_FLOOR | OOM | SPEC_ASSERT | ENGINE_ERROR | TIMEOUT | CLIENT_ERROR
     flags: list[str] = Field(default_factory=list)
     quality: QualityResult = Field(default_factory=QualityResult)
+    # Repeats (ladder.repeats): how many decode windows were measured on this
+    # rung's context. When > 1 the REPEAT_METRICS fields above are medians and
+    # repeat_stats has the per-repeat values. Quality checks run once per rung.
+    repeats: int = 1
+    repeat_stats: dict[str, RepeatStat] = Field(default_factory=dict)
     started_utc: str | None = None
     started_local: str | None = Field(
         default=None, validation_alias=AliasChoices("started_local", "started_et")

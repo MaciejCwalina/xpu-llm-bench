@@ -361,6 +361,80 @@
       "title": "QualityResult",
       "type": "object"
     },
+    "RepeatStat": {
+      "description": "One metric across the repeated decode windows of a rung.",
+      "properties": {
+        "max": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max"
+        },
+        "median": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Median"
+        },
+        "min": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Min"
+        },
+        "n": {
+          "default": 0,
+          "title": "N",
+          "type": "integer"
+        },
+        "stdev": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stdev"
+        },
+        "values": {
+          "items": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "title": "Values",
+          "type": "array"
+        }
+      },
+      "title": "RepeatStat",
+      "type": "object"
+    },
     "RunManifest": {
       "properties": {
         "abort_reason": {
@@ -1305,6 +1379,18 @@
           ],
           "default": null,
           "title": "Reason"
+        },
+        "repeat_stats": {
+          "additionalProperties": {
+            "$ref": "#/$defs/RepeatStat"
+          },
+          "title": "Repeat Stats",
+          "type": "object"
+        },
+        "repeats": {
+          "default": 1,
+          "title": "Repeats",
+          "type": "integer"
         },
         "rss_kib": {
           "additionalProperties": {

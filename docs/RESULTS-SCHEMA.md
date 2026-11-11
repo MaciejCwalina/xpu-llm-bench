@@ -63,11 +63,12 @@ The default markdown table (`report.SUMMARY_COLUMNS`) uses:
 Fields on the row that are not in the table: `session_seeds`, `temperature`,
 `launch_fingerprint`, `image_id`, `boot_started_at`, `verify_steps_stream`,
 `draft_tokens`, `accepted_drafts`, `drafts`, `prefill_tokens`,
-`attention_evidence`, and timestamps.
+`attention_evidence`, `repeats`, `repeat_stats`, and timestamps.
 
 - `rung_id` is `{prompt_type}:{load_short}:{users}u:{ctx}:{phase}`, where phase is `S` (session-1 growth), `C` (a user count climbing), or `meas` (grid shape).
 - `ctx_tokens` lists the context of every live decoding session as reported by the server (`prompt_tokens`). `ctx_per_user` is the rung's target; `ctx_fill_pct` is mean(`ctx_tokens`) / target × 100 (filled to within ~1% when the server has `/tokenize`).
 - A `CTX_CEILING` row with `exit_reason: CTX_CEILING` was never sent (KV capacity check); other ceiling rows keep the failure's exit reason and carry the `CTX_CEILING` flag.
+- `repeats` is the number of decode windows measured on this rung's context (`ladder.repeats`, default 1). When it is > 1, `decode_tok_s_per_user`, `steps_s_per_user`, `accepted_drafts_per_step`, `hit_rate`, `ttft_ms` and `prefill_tok_s` are medians across repeats (totals = median per user × users), and `repeat_stats` maps each of those fields to `{values, n, median, min, max, stdev}`: `values` is per repeat in order (null for a failed repeat), `stdev` is the sample stdev and only set when n ≥ 3. Prefill is measured once per rung, so its entry holds that single value (n = 1). With `repeats: 1`, `repeat_stats` is empty. Quality is checked once per rung. These two fields are in the JSONL, not in the fixed CSV columns.
 - `quality` holds needle, code-edit, format/repetition, greedy reference/divergence, and logprob scores. Unchecked items are null.
 - `valid` is `valid`, `warning` (see METHODOLOGY §6), or `invalid`.
 - `exit_reason` is set only on failed rungs.
@@ -101,6 +102,7 @@ Fields on the row that are not in the table: `session_seeds`, `temperature`,
 | `CLIENT_ERROR` | Request failed without a server-side cause in the logs. |
 | `REBOOTED` | Container StartedAt changed mid-run (boot-once violated). |
 | `RESUMED_REFILL` | First rung after --resume on a new boot: sessions were re-prefilled. |
+| `REPEAT_FAILED` | One of the repeated decode windows (ladder.repeats) failed; it is left out of the median / min / max. |
 | `QUALITY_FAIL` | A quality check failed on this rung (see quality fields). |
 | `CONVERTED` | Value converted from a legacy definition (import-legacy). |
 | `DRY_RUN` | Placeholder row from --dry-run. |

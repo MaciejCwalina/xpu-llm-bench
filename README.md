@@ -82,6 +82,7 @@ test container; the harness measures it and checks it is what the spec says.
    bench plan my-spec.yaml --max-model-len 262144 --kv-capacity-tokens 700000   # full auto ladder + per-user-count ceilings
    bench run my-spec.yaml --dry-run      # plan + the exact safety commands; writes only <out>/<spec>/dry-run/
    bench run my-spec.yaml --output-dir results
+   bench run my-spec.yaml --repeats 3    # measure each rung's decode window 3x on the same context (median, min to max)
    bench report results/<spec-name>      # markdown on stdout
    bench report results/<spec-name> --html   # self-contained report.html with charts
    ```

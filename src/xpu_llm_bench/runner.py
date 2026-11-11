@@ -65,6 +65,7 @@ from xpu_llm_bench.quality import (
 )
 from xpu_llm_bench.ram import LocalMemInfo, RamFloorError, RamSource, RamWatcher, SshMemInfo
 from xpu_llm_bench.results import (
+    REPEAT_METRICS,
     AttentionSnapshot,
     DecodeMethod,
     GraphSnapshot,
@@ -75,6 +76,7 @@ from xpu_llm_bench.results import (
     SpecDecodeSnapshot,
     local_tz_name,
     read_jsonl,
+    repeat_stat,
     stamp_pair,
     write_jsonl_row,
 )
@@ -380,6 +382,33 @@ def _mean(xs: list[float | None]) -> float | None:
 def _sum(xs: list[float | None]) -> float | None:
     vals = [x for x in xs if x is not None]
     return sum(vals) if vals else None
+
+
+def apply_repeats(row: RungResult, extra: list[dict[str, float | None] | None]) -> None:
+    """Fold repeats 2..N into ``row`` (which holds repeat 1).
+
+    Each REPEAT_METRICS field becomes the median across repeats and
+    ``repeat_stats`` keeps the per-repeat values, min, max and (n >= 3) stdev.
+    A failed repeat contributes None. Prefill is measured once per rung (the
+    context is not regrown between repeats), so its stat holds that single
+    value (n=1, no range).
+    """
+    first = {m: getattr(row, m) for m in REPEAT_METRICS}
+    per = [first] + list(extra)
+    row.repeats = len(per)
+    stats = {}
+    for m in REPEAT_METRICS:
+        vals = [first[m]] if m == "prefill_tok_s" else [(p or {}).get(m) for p in per]
+        st = repeat_stat(vals)
+        stats[m] = st
+        if st.median is not None:
+            setattr(row, m, st.median)
+    row.repeat_stats = stats
+    users = max(row.users, 1)
+    if row.decode_tok_s_per_user is not None:
+        row.decode_tok_s_total = row.decode_tok_s_per_user * users
+    if row.steps_s_per_user is not None:
+        row.steps_s_total = row.steps_s_per_user * users
 
 
 def _host_exec(spec: RunSpec) -> HostExec:
@@ -927,6 +956,76 @@ class Runner:
             flags.append("MIXED_PATH")
         return sorted(set(flags)), batch, sizes
 
+    def _window(self, rung: Rung, sessions: dict[int, Session]):
+        """One measured decode window on the sessions' current context."""
+        before = parse_prometheus(self._metrics_text())
+        t_window = time.time()
+        sampler = WindowSampler(self._metrics_text, self.spec.metrics, self.spec.ladder.metrics_poll_s, self._procs)
+        sampler.start()
+        delay = self.spec.ladder.staggered.delay_s if rung.load_mode == "staggered" else 0.0
+        collected: dict[int, StreamResult] = {}
+
+        def _one(sid: int, start_delay: float) -> None:
+            if start_delay:
+                self.sleep(start_delay)
+            collected[sid] = self._stream(sessions[sid].messages, rung.output_tokens, measured=True)
+
+        threads = []
+        for i, sid in enumerate(rung.decoding_sessions):
+            start_delay = i * delay
+            if rung.load_mode == "open_loop":
+                start_delay = i / max(self.spec.ladder.open_loop.requests_per_second, 1e-6)
+            th = threading.Thread(target=_one, args=(sid, start_delay), daemon=True)
+            threads.append(th)
+            th.start()
+        for th in threads:
+            th.join()
+        samples = sampler.stop()
+        after = parse_prometheus(self._metrics_text())
+        log_lines = bootlog.lines_since(self._logs_text(), t_window - 1.0)
+        return collected, samples, before, after, log_lines, t_window
+
+    def _repeat_window(self, rung: Rung, sessions: dict[int, Session], k: int | None) -> tuple[dict[str, float | None] | None, str | None]:
+        """Re-measure the decode window on the same context (no regrow, replies not appended).
+
+        Returns the per-repeat values of the repeated metrics, or (None, error).
+        Prefill is not re-measured (the context is not regrown); the caller
+        carries the rung's single prefill value.
+        """
+        collected, _samples, before, after, _logs, _t = self._window(rung, sessions)
+        errs = []
+        for sid in rung.decoding_sessions:
+            r = collected.get(sid)
+            if r is None or r.error:
+                errs.append(f"session {sid}: {'no result' if r is None else r.error}")
+        if errs:
+            return None, "; ".join(errs)
+        mtp = mtp_window(before, after, self.spec.metrics)
+        chunk_stats, sstats, per_step_ok = [], [], True
+        for sid in rung.decoding_sessions:
+            r = collected[sid]
+            per_step_ok = per_step_ok and r.per_step_counts
+            chunk_stats.append(ChunkStats(tokens=r.output_tokens, chunks=r.chunks, t_first=r.first_token_at, t_last=r.last_token_at))
+            sstats.append(stream_stats(r.t_send, r.first_token_at, r.t_end, r.token_times, r.output_tokens,
+                                       prompt_tokens=r.prompt_tokens, cached_tokens=r.cached_tokens))
+        E = sum(c.decode_tokens for c in chunk_stats)
+        S_stream = sum(c.verify_steps for c in chunk_stats)
+        S_server = int(mtp.drafts) if mtp.drafts is not None else None
+        if per_step_ok and S_stream > 0:
+            S = S_stream
+            steps_each = [c.steps_s for c in chunk_stats]
+        else:
+            S = S_server
+            share = (S_server or 0) / max(len(chunk_stats), 1)
+            steps_each = [(share / c.window_s) if c.window_s else None for c in chunk_stats]
+        return {
+            "decode_tok_s_per_user": _mean([c.decode_tok_s for c in chunk_stats]),
+            "steps_s_per_user": _mean(steps_each),
+            "accepted_drafts_per_step": (E / S - 1.0) if S else None,
+            "hit_rate": true_hit_rate(E, S, k) if (k and S) else None,
+            "ttft_ms": _mean([st.ttft_ms for st in sstats]),
+        }, None
+
     def _measure_rung(
         self,
         run_id: str,
@@ -978,32 +1077,8 @@ class Runner:
         if grow_errors:
             return self._failed_row(base, rung, sessions, grow_errors, timed_out=False, since=time.time() - 600)
 
-        # Measured window.
-        before = parse_prometheus(self._metrics_text())
-        t_window = time.time()
-        sampler = WindowSampler(self._metrics_text, self.spec.metrics, self.spec.ladder.metrics_poll_s, self._procs)
-        sampler.start()
-        delay = self.spec.ladder.staggered.delay_s if rung.load_mode == "staggered" else 0.0
-        collected: dict[int, StreamResult] = {}
-
-        def _one(sid: int, start_delay: float) -> None:
-            if start_delay:
-                self.sleep(start_delay)
-            collected[sid] = self._stream(sessions[sid].messages, rung.output_tokens, measured=True)
-
-        threads = []
-        for i, sid in enumerate(rung.decoding_sessions):
-            start_delay = i * delay
-            if rung.load_mode == "open_loop":
-                start_delay = i / max(self.spec.ladder.open_loop.requests_per_second, 1e-6)
-            th = threading.Thread(target=_one, args=(sid, start_delay), daemon=True)
-            threads.append(th)
-            th.start()
-        for th in threads:
-            th.join()
-        samples = sampler.stop()
-        after = parse_prometheus(self._metrics_text())
-        log_lines = bootlog.lines_since(self._logs_text(), t_window - 1.0)
+        # Measured window (repeat 1; more repeats below on the same context).
+        collected, samples, before, after, log_lines, t_window = self._window(rung, sessions)
 
         errors: list[str] = []
         timeouts = 0
@@ -1099,6 +1174,16 @@ class Runner:
         if self.fp and fp_now and fp_now.started_at and self.fp.started_at and fp_now.started_at != self.fp.started_at:
             flags.append("REBOOTED")
 
+        # Repeats 2..N: same context (nothing regrown, no replies appended yet).
+        extra: list[dict[str, float | None] | None] = []
+        for _ in range(max(self.spec.ladder.repeats, 1) - 1):
+            vals, err = self._repeat_window(rung, sessions, k)
+            watcher.raise_if_tripped()
+            if err:
+                flags.append("REPEAT_FAILED")
+                self._runlog(f"{rung.rung_id}: repeat failed: {err}")
+            extra.append(vals)
+
         # Assistant replies are appended (conversation grows; never edited).
         for sid in rung.decoding_sessions:
             sessions[sid].append_reply(collected[sid].text)
@@ -1146,7 +1231,7 @@ class Runner:
         if attention in ("fallback", "mixed") and valid == "valid":
             valid, reason = "warning", f"attention path={attention}"
         acc_step = (E / S - 1.0) if S else None
-        return RungResult(
+        row = RungResult(
             **base,
             ctx_tokens=ctxs,
             ctx_fill_pct=fill_pct,
@@ -1203,6 +1288,9 @@ class Runner:
             finished_utc=utc1,
             finished_local=et1,
         )
+        if self.spec.ladder.repeats > 1:
+            apply_repeats(row, extra)
+        return row
 
     def _failed_row(
         self,

@@ -45,6 +45,24 @@ def _add_profile(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_repeats(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--repeats",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Measure each rung's decode window N times on the same context (default: spec ladder.repeats, 1)",
+    )
+
+
+def _apply_repeats(spec, n: int | None) -> None:
+    if n is None:
+        return
+    if n < 1 or n > 50:
+        raise SystemExit("--repeats must be between 1 and 50")
+    spec.ladder.repeats = n
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bench",
@@ -83,10 +101,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Server KV cache capacity in tokens (boot log 'KV cache size: N tokens'), for per-user-count ceilings",
     )
     _add_profile(plan)
+    _add_repeats(plan)
 
     run = sub.add_parser("run", help="Drive the ladder against an OpenAI-compatible endpoint")
     run.add_argument("spec", type=Path)
     run.add_argument("--output-dir", type=Path, default=Path("results"))
+    _add_repeats(run)
     run.add_argument("--resume", action="store_true", help="Skip rungs already completed in the output dir")
     run.add_argument(
         "--dry-run",
@@ -215,6 +235,7 @@ def _no_results(run_path: Path, manifest: RunManifest | None) -> int:
 def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.cmd == "plan":
         spec = load_spec(args.spec, profile=args.profile)
+        _apply_repeats(spec, args.repeats)
         mem, basis = None, "live"
         if args.mem_available is not None:
             mem, basis = args.mem_available, "given"
@@ -231,6 +252,7 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return 0  # estimates are informational; nothing in a plan blocks a run
     if args.cmd == "run":
         spec = load_spec(args.spec, profile=args.profile)
+        _apply_repeats(spec, args.repeats)
         print(describe_site())
         if spec.ladder.shape == "grid":
             print(GRID_WARNING, file=sys.stderr)

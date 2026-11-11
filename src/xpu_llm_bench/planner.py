@@ -137,6 +137,7 @@ class Plan:
     target_minutes: float | None
     fits_target: bool | None
     feasibility: Feasibility
+    repeats: int = 1
     issues: list[str] = field(default_factory=list)
     contexts: list[int] = field(default_factory=list)
     context_note: str = ""
@@ -165,6 +166,9 @@ def estimate_seconds(spec: RunSpec, rungs: list[Rung]) -> float:
         # Closed-all and staggered: decode window ≈ output tokens / per-user rate
         # (users decode in parallel). Open-loop uses the same window as a lower bound.
         decode_s = rung.output_tokens / max(a.assumed_decode_tok_s_per_user, 1e-6)
+        # ladder.repeats re-measures the window on the same context; the prompt
+        # is not regrown (the server's prefix cache serves the re-send).
+        decode_s *= max(spec.ladder.repeats, 1)
         warmup_s = 0.0
         if spec.ladder.warmup.requests and spec.ladder.warmup.tokens:
             warmup_s = (spec.ladder.warmup.tokens / max(a.assumed_decode_tok_s_per_user, 1e-6)) * spec.ladder.warmup.requests
@@ -333,6 +337,8 @@ def make_plan(
         issues.append(
             f"Estimated {seconds / 60.0:.1f} min exceeds the {target:.1f} min target. "
             "Shorten output_tokens_per_rung, drop a load mode, or use --profile quick."
+            + (f" repeats={spec.ladder.repeats} multiplies every decode window; fewer --repeats is shorter."
+               if spec.ladder.repeats > 1 else "")
         )
     return Plan(
         spec_name=spec.name,
@@ -340,6 +346,7 @@ def make_plan(
         rungs=rungs,
         estimated_seconds=seconds,
         target_minutes=target,
+        repeats=spec.ladder.repeats,
         fits_target=fits,
         feasibility=(feas := feasibility(
             spec, rungs, mem_available_gib, basis, kv_capacity_tokens,
@@ -369,6 +376,7 @@ def format_plan(plan: Plan) -> str:
         f"Estimated wall time: {plan.estimated_minutes:.1f} min "
         f"({plan.estimated_seconds:.0f} s)"
         + (f"  target={plan.target_minutes:.1f} min" if plan.target_minutes is not None else "")
+        + (f"  repeats={plan.repeats} per rung" if plan.repeats > 1 else "")
         + ("  OK" if plan.fits_target else "" if plan.fits_target is None else "  OVER TARGET")
     )
     feas = plan.feasibility

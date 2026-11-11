@@ -186,6 +186,23 @@ over the window. Every verify step of every request counts one draft.
 snapshots are taken after growth and before the window, so prefill steps are
 excluded.
 
+**Repeats (`ladder.repeats`, `--repeats N`, default 1).** With N > 1 the
+decode window is measured N times back to back on the same context: the
+context is grown once, the same messages are re-sent for each repeat, and
+no reply is appended until all N windows are done (repeat 1's reply is the
+one kept, so later rungs see the same conversation as with N = 1).
+For decode tok/s, steps/s, accepted drafts/step, true hit rate and TTFT
+the row stores the median across repeats, and `repeat_stats` keeps every
+per-repeat value with min, max and (N ≥ 3) the sample stdev. Totals are the
+median per user × users. Prefill is measured once per rung (from the growth
+requests; nothing is regrown), so its `repeat_stats` entry holds that one
+value (n = 1) and the report shows no range for it. Flags, ITL, KV/queue samples and the attention path come from
+repeat 1. Quality checks run once per rung, not per repeat. A repeat that
+errors is left out of the stats and flags the row `REPEAT_FAILED`. Re-sent
+prompts are normally served from the prefix cache, so repeat TTFTs are
+lower than a cold first request; compare TTFT only across runs with the
+same `repeats`. `bench plan` multiplies the decode window by N.
+
 ## 4. Metrics (per rung)
 
 Notation: k = `server.speculative.num_speculative_tokens` (**a spec parameter,
@@ -286,7 +303,8 @@ The full flag list with meanings is `results.FLAGS` and appears in each report.
    - **Code edit:** on code-edit S rungs, a small buggy function plus a request to fix it is appended to session 1's context. The reply's code runs against fixed asserts in an isolated child Python (`-I`, temp dir, CPU 5 s, 512 MB address-space rlimit, empty env).
    - **Format / repetition:** on writing and chat outputs, the text is cut at EOS. Checks: leaked special tokens, non-printables, chat role bleed (`User:`), 6-gram repeat ratio > 0.35, and the same line 3+ times.
 
-Any failure → `QUALITY_FAIL`.
+Any failure → `QUALITY_FAIL`. With `ladder.repeats` > 1 the checks still
+run once per rung, on repeat 1's output.
 
 ## 8. Reporting and comparison
 
@@ -295,6 +313,11 @@ Any failure → `QUALITY_FAIL`.
 boot evidence, hold), quoted evidence lines, **one table** with steps/s next
 to tok/s, flags legend. `--csv` writes every column. The column order is
 fixed (`report.COLUMNS`).
+
+HTML (`--html`): when a run used repeats, chart points are medians with
+min–max error bars, and the averages cards and All numbers show
+`median (min to max, n=N)` (stdev on hover in All numbers when N ≥ 3).
+With the default `repeats: 1` the report is unchanged.
 
 `bench compare A B` pairs rows on (users, ctx, prompt type); repeated keys
 within one run (e.g. two load modes) stay separate pairs in order. A pair

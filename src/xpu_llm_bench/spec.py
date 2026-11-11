@@ -257,6 +257,10 @@ class LadderSpec(BaseModel):
     # on to the next user count instead of aborting the run.
     stop_at_ceiling: bool = True
     concurrency_steps: list[int] = Field(default_factory=lambda: [1, 2, 4, 8])
+    # Measure each rung's decode window this many times on the same context
+    # (the context is not regrown between repeats). Rows report the median with
+    # min/max (stdev from 3). Quality checks still run once per rung.
+    repeats: int = Field(default=1, ge=1, le=50)
     load_modes: list[LoadMode] = Field(default_factory=lambda: ["closed_all_decoding"])
     open_loop: OpenLoopSettings = Field(default_factory=OpenLoopSettings)
     staggered: StaggeredSettings = Field(default_factory=StaggeredSettings)

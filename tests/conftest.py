@@ -49,6 +49,7 @@ class MetricsState:
         self.max_model_len: int | None = None  # reported by /v1/models when set
         self.reject_above: int | None = None  # 400 "maximum context length" above this many prompt tokens
         self.cache_blocks: tuple[int, int] | None = None  # (num_gpu_blocks, block_size) for cache_config_info
+        self.chat_log: list[tuple[int, int]] = []  # (prompt_tokens, max_tokens) per answered chat request
 
     def bump(self, output_tokens: int, prompt_tokens: int, chunks: list[int] | None = None) -> None:
         """Account one request. ``chunks`` = tokens per streamed step; the first
@@ -202,6 +203,8 @@ def make_handler(state: MetricsState, logs: list[str]):
                 while sum(chunks) < max_tokens:
                     chunks.append(min(4, max_tokens - sum(chunks)))
                 state.bump(max_tokens, prompt_tokens, chunks)
+                with state.lock:
+                    state.chat_log.append((prompt_tokens, max_tokens))
                 logs.append(f"QSA_GRAPH width=65536 n={max_tokens}")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")

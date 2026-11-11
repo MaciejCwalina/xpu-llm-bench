@@ -18,7 +18,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
-from xpu_llm_bench.results import FLAGS, RungResult, RunManifest
+from xpu_llm_bench.results import FLAGS, REPEAT_METRICS, RepeatStat, RungResult, RunManifest
 
 # (field, title, unit, scale, needs_spec_decode)
 METRICS: list[tuple[str, str, str, float, bool]] = [
@@ -84,6 +84,8 @@ pre{white-space:pre-wrap;word-break:break-all;background:var(--card);padding:8px
 .ac-t{font-size:11px;width:100%}.ac-t td,.ac-t th{padding:1px 4px}
 svg .ceil{stroke:var(--bad);stroke-width:2}
 """
+# Only added when a run used repeats, so default output stays byte-identical.
+CSS_REPEATS = "svg .ebar{stroke-width:1.5;opacity:.75}\n.ac-big em{font-style:normal;font-size:10px;color:var(--muted)}\n"
 
 
 def group_label(prompt_type: str, load_mode: str) -> str:
@@ -194,6 +196,26 @@ class Point:
     flags: list[str]
     rung_ids: list[str]
     valid: str
+    lo: float | None = None  # min across repeats (only when repeats > 1)
+    hi: float | None = None
+    n: int = 1
+
+
+def repeat_range(r: RungResult, field: str) -> RepeatStat | None:
+    """The row's repeat stats for ``field`` when it was measured more than once."""
+    if (r.repeats or 1) <= 1 or not r.repeat_stats:
+        return None
+    st = r.repeat_stats.get(field)
+    if st is None or st.n <= 1 or st.min is None or st.max is None:
+        return None
+    return st
+
+
+def fmt_repeat(st: RepeatStat, scale: float = 1.0, unit: str = "") -> str:
+    """'median (min to max, n=N)'. Percentages keep one decimal like the plain cells."""
+    def f(v: float) -> str:
+        return f"{v * scale:.1f}" if unit == "%" else _fmt(v * scale)
+    return f"{f(st.median)}{unit} ({f(st.min)} to {f(st.max)}{unit}, n={st.n})"
 
 
 def _series(rows: list[RungResult], field: str, scale: float) -> dict[int, list[Point]]:
@@ -211,7 +233,13 @@ def _series(rows: list[RungResult], field: str, scale: float) -> dict[int, list[
             continue
         flags = sorted({f for r in group for f in r.flags})
         valid = "valid" if all(r.valid == "valid" for r in group) else "invalid"
-        out[users].append(Point(ctx, sum(nums) / len(nums), flags, [r.rung_id for r in group], valid))
+        pt = Point(ctx, sum(nums) / len(nums), flags, [r.rung_id for r in group], valid)
+        rngs = [st for st in (repeat_range(r, field) for r in group) if st is not None]
+        if rngs:
+            pt.lo = min(st.min for st in rngs) * scale  # type: ignore[operator]
+            pt.hi = max(st.max for st in rngs) * scale  # type: ignore[operator]
+            pt.n = max(st.n for st in rngs)
+        out[users].append(pt)
     return out
 
 
@@ -235,7 +263,7 @@ def svg_chart(
     info) puts a marker at the end of that user count's line (run 0)."""
     data = [(label, _series(rows, field, scale)) for label, rows in runs]
     ctxs = sorted({p.ctx for _, s in data for pts in s.values() for p in pts})
-    vals = [p.value for _, s in data for pts in s.values() for p in pts]
+    vals = [v for _, s in data for pts in s.values() for p in pts for v in (p.value, p.hi) if v is not None]
     head = f'<div class="card"><h3>{_e(title)} <span class="muted">({_e(unit)})</span></h3>'
     if not ctxs:
         return head + '<p class="muted">No data for this metric.</p></div>'
@@ -296,6 +324,14 @@ def svg_chart(
                 tip = f"{name}, {ctx_label(p.ctx)} context: {_fmt(p.value)} {unit}"
                 if len(p.rung_ids) > 1:
                     tip += f" (mean of {len(p.rung_ids)} rows)"
+                if p.lo is not None and p.hi is not None:
+                    tip += f"\nmedian of {p.n} repeats; min to max {_fmt(p.lo)} to {_fmt(p.hi)} {unit}"
+                    xc, ylo, yhi = x(p.ctx), y(p.lo), y(p.hi)
+                    parts.append(f'<g class="ebar" data-users="{users}" stroke="{col}">'
+                                 f'<line x1="{xc:.1f}" x2="{xc:.1f}" y1="{yhi:.1f}" y2="{ylo:.1f}"/>'
+                                 f'<line x1="{xc - 4:.1f}" x2="{xc + 4:.1f}" y1="{yhi:.1f}" y2="{yhi:.1f}"/>'
+                                 f'<line x1="{xc - 4:.1f}" x2="{xc + 4:.1f}" y1="{ylo:.1f}" y2="{ylo:.1f}"/>'
+                                 f'<title>{_e(tip)}</title></g>')
                 if p.flags:
                     tip += "\nflags: " + ", ".join(p.flags)
                 if p.valid != "valid":
@@ -325,7 +361,7 @@ def svg_chart(
     return head + "".join(parts) + "</div>"
 
 
-def _legend(users_order: list[int], labels: list[str], caption: str | None = None) -> str:
+def _legend(users_order: list[int], labels: list[str], caption: str | None = None, repeats: int = 1) -> str:
     items = [f"<span><b>{_e(caption)}</b></span>"] if caption else []
     for i, u in enumerate(users_order):
         items.append(f'<span><svg width="22" height="10"><line x1="0" x2="22" y1="5" y2="5" stroke="{_color(i)}" '
@@ -341,6 +377,10 @@ def _legend(users_order: list[int], labels: list[str], caption: str | None = Non
     items.append('<span><svg width="14" height="20"><g stroke="currentColor" stroke-width="2"><line x1="7" x2="7" '
                  'y1="1" y2="19"/><line x1="3" x2="11" y1="1" y2="1"/><line x1="3" x2="11" y1="19" y2="19"/></g>'
                  '</svg>line ends at that user count\'s context ceiling (hover for the reason)</span>')
+    if repeats > 1:
+        items.append('<span><svg width="10" height="20"><g stroke="currentColor" stroke-width="1.5"><line x1="5" x2="5" '
+                     'y1="2" y2="18"/><line x1="1" x2="9" y1="2" y2="2"/><line x1="1" x2="9" y1="18" y2="18"/></g>'
+                     f'</svg>point = median of {repeats} repeats, bar = min to max</span>')
     return '<div class="legend">' + "".join(items) + "</div>"
 
 
@@ -414,19 +454,38 @@ def average_rows(rows: list[RungResult]) -> tuple[list[RungResult], list[dict[st
             continue
         excluded = {t: _exclusion_reason(all_by_type.get(t, [])) for t in types if t not in clean}
         per_type: dict[str, dict[str, float | None]] = {}
+        type_rng: dict[str, dict[str, RepeatStat]] = {}
         for t, rs in clean.items():
             per_type[t] = {}
+            type_rng[t] = {}
             for field, _title, _scale in AVG_METRICS:
                 nums = [float(getattr(x, field)) for x in rs if isinstance(getattr(x, field), (int, float))]
                 per_type[t][field] = sum(nums) / len(nums) if nums else None
+                sts = [st for st in (repeat_range(x, field) for x in rs) if st is not None]
+                if sts and per_type[t][field] is not None and len(sts) == len(rs):
+                    type_rng[t][field] = RepeatStat(
+                        n=min(st.n for st in sts), median=per_type[t][field],
+                        min=sum(st.min for st in sts) / len(sts),  # type: ignore[misc]
+                        max=sum(st.max for st in sts) / len(sts),  # type: ignore[misc]
+                    )
         averaged = not excluded
         rec: dict[str, Any] = {"load_mode": mode, "users": users, "ctx": ctx, "types": types,
-                               "averaged": averaged, "breakdown": per_type, "excluded": excluded}
+                               "averaged": averaged, "breakdown": per_type, "excluded": excluded,
+                               "breakdown_ranges": type_rng}
         vals: dict[str, float | None] = {}
+        avg_rng: dict[str, RepeatStat] = {}
         for field, _title, _scale in AVG_METRICS:
             got = [per_type[t][field] for t in types if t in per_type and per_type[t][field] is not None]
             vals[field] = sum(got) / len(got) if averaged and len(got) == len(types) else None
+            # Range of the averaged value: mean of the per-type minima to mean of the maxima.
+            rg = [type_rng.get(t, {}).get(field) for t in types]
+            if vals[field] is not None and all(rg):
+                avg_rng[field] = RepeatStat(
+                    n=min(r.n for r in rg), median=vals[field],  # type: ignore[union-attr]
+                    min=sum(r.min for r in rg) / len(rg), max=sum(r.max for r in rg) / len(rg),  # type: ignore[misc,union-attr]
+                )
         rec.update(vals)
+        rec["ranges"] = avg_rng
         table.append(rec)
         if averaged:
             avg_rows.append(RungResult.model_construct(
@@ -434,12 +493,20 @@ def average_rows(rows: list[RungResult]) -> tuple[list[RungResult], list[dict[st
                 rung_id=f"average of {' · '.join(_type_label(t) for t in types)} ({users}u, {ctx_label(ctx)})",
                 users=users, ctx_per_user=ctx, ctx_tokens=[], prompt_type=AVG_LABEL, load_mode=mode,
                 flags=[], valid="valid", exit_reason=None, **vals,
+                repeats=max((r.n for r in avg_rng.values()), default=1), repeat_stats=avg_rng,
             ))
     return avg_rows, table
 
 
 def _avg_val(v: float | None, scale: float = 1.0) -> str:
     return _fmt(v * scale) if isinstance(v, (int, float)) else "n/a"
+
+
+def _rng_txt(rng: RepeatStat | None, scale: float = 1.0, unit: str = "") -> str:
+    """' (min to max, n=N)' after a value measured more than once; '' otherwise."""
+    if rng is None or rng.min is None or rng.max is None or rng.n <= 1:
+        return ""
+    return f" ({_fmt(rng.min * scale)} to {_fmt(rng.max * scale)}{unit}, n={rng.n})"
 
 
 def averages_cards(table: list[dict[str, Any]]) -> str:
@@ -453,12 +520,20 @@ def averages_cards(table: list[dict[str, Any]]) -> str:
                 f'<span class="muted"> · {_e(LOAD_LABELS.get(rec["load_mode"], rec["load_mode"]))}</span></div>')
         if rec["averaged"]:
             of = "Avg of " + " · ".join(_type_label(t) for t in types)
-            big = (f'<div class="ac-big"><div><b>{_avg_val(rec["steps_s_per_user"])}</b><span>steps/s per user</span>'
-                   f'</div><div><b>{_avg_val(rec["decode_tok_s_per_user"])}</b><span>decode tok/s per user</span>'
-                   "</div></div>")
-            small = (f'<div class="ac-small">drafts/step {_avg_val(rec["accepted_drafts_per_step"])} · '
-                     f'hit rate {_avg_val(rec["hit_rate"], 100.0)}% · TTFT {_avg_val(rec["ttft_ms"])} ms · '
-                     f'prefill {_avg_val(rec["prefill_tok_s"])} tok/s</div>')
+            rg = rec.get("ranges") or {}
+
+            def _em(field: str, rg: dict = rg) -> str:
+                t = _rng_txt(rg.get(field))
+                return f"<em>{_e(t.strip())}</em>" if t else ""
+
+            big = (f'<div class="ac-big"><div><b>{_avg_val(rec["steps_s_per_user"])}</b>{_em("steps_s_per_user")}'
+                   f'<span>steps/s per user</span></div><div><b>{_avg_val(rec["decode_tok_s_per_user"])}</b>'
+                   f'{_em("decode_tok_s_per_user")}<span>decode tok/s per user</span></div></div>')
+            small = (f'<div class="ac-small">drafts/step {_avg_val(rec["accepted_drafts_per_step"])}'
+                     f'{_e(_rng_txt(rg.get("accepted_drafts_per_step")))} · '
+                     f'hit rate {_avg_val(rec["hit_rate"], 100.0)}%{_e(_rng_txt(rg.get("hit_rate"), 100.0, "%"))} · '
+                     f'TTFT {_avg_val(rec["ttft_ms"])} ms{_e(_rng_txt(rg.get("ttft_ms")))} · '
+                     f'prefill {_avg_val(rec["prefill_tok_s"])} tok/s{_e(_rng_txt(rg.get("prefill_tok_s")))}</div>')
             cls = "acard"
         else:
             kept = [t for t in types if t in rec["breakdown"]]
@@ -470,8 +545,11 @@ def averages_cards(table: list[dict[str, Any]]) -> str:
         for t in types:
             b = rec["breakdown"].get(t)
             if b is not None:
-                rows_html.append(f'<tr><td>{_e(_type_label(t))}</td><td>{_avg_val(b["steps_s_per_user"])}</td>'
-                                 f'<td>{_avg_val(b["decode_tok_s_per_user"])}</td></tr>')
+                br = (rec.get("breakdown_ranges") or {}).get(t, {})
+                rows_html.append(f'<tr><td>{_e(_type_label(t))}</td><td>{_avg_val(b["steps_s_per_user"])}'
+                                 f'{_e(_rng_txt(br.get("steps_s_per_user")))}</td>'
+                                 f'<td>{_avg_val(b["decode_tok_s_per_user"])}'
+                                 f'{_e(_rng_txt(br.get("decode_tok_s_per_user")))}</td></tr>')
             else:
                 rows_html.append(f'<tr class="bad"><td>{_e(_type_label(t))}</td><td colspan="2">excluded: '
                                  f'{_e(rec["excluded"].get(t, ""))}</td></tr>')
@@ -492,6 +570,10 @@ def has_spec_decode(rows: list[RungResult], manifest: RunManifest | None) -> boo
 
 def _cell(r: RungResult, col: str) -> str:
     v = getattr(r, col, None)
+    if col in REPEAT_METRICS:
+        st = repeat_range(r, col)
+        if st is not None:
+            return fmt_repeat(st, 100.0, "%") if col == "hit_rate" else fmt_repeat(st)
     if col == "hit_rate" and isinstance(v, (int, float)):
         return f"{v * 100:.1f}%"
     if isinstance(v, float):
@@ -501,12 +583,21 @@ def _cell(r: RungResult, col: str) -> str:
     return "" if v is None else str(v)
 
 
+def _stdev_title(r: RungResult, col: str) -> str:
+    st = repeat_range(r, col) if col in REPEAT_METRICS else None
+    if st is None or st.stdev is None:
+        return ""
+    sc = 100.0 if col == "hit_rate" else 1.0
+    return f' title="stdev {_e(_fmt(st.stdev * sc))} over {st.n} repeats"'
+
+
 def numbers_table(rows: list[RungResult]) -> str:
     head = "".join(f"<th>{_e(c)}</th>" for c in TABLE_COLUMNS)
     body = []
     for r in rows:
         cls = ' class="bad"' if (HOLLOW_FLAGS & set(r.flags)) or r.valid != "valid" else ""
-        body.append(f"<tr{cls}>" + "".join(f"<td>{_e(_cell(r, c))}</td>" for c in TABLE_COLUMNS) + "</tr>")
+        body.append(f"<tr{cls}>" + "".join(f"<td{_stdev_title(r, c)}>{_e(_cell(r, c))}</td>" for c in TABLE_COLUMNS)
+                    + "</tr>")
     return f'<div class="wide"><table><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
 
 
@@ -597,6 +688,10 @@ def _header(rows: list[RungResult], manifest: RunManifest | None) -> str:
                       + (f" (from {m.max_model_len_source})" if m.max_model_len_source else "")
                       + (f"; rungs {', '.join(ctx_label(c) for c in m.context_rungs)}" if m.context_rungs else "")
                       + (f"; {m.context_note}" if m.context_note else "")))
+    n_rep = max((r.repeats or 1 for r in rows), default=1)
+    if n_rep > 1:
+        items.append(("repeats", f"{n_rep} decode windows per rung on the same context; numbers are medians with "
+                      "(min to max, n=N); quality checks ran once per rung; prefill is measured once per rung"))
     if m and m.kv_capacity_tokens:
         items.append(("KV capacity", f"{m.kv_capacity_tokens:,} tokens (from {m.kv_capacity_source})"))
     if m and m.pre_run_load:
@@ -671,11 +766,12 @@ def render_html(
     spec_on = any(has_spec_decode(rs, manifest if i == 0 else None) for i, (_, rs) in enumerate(runs))
     ceilings = ctx_ceilings(rows, manifest)
     ttl = title or f"xpu-llm-bench report — {label0}"
+    css = CSS + (CSS_REPEATS if any((r.repeats or 1) > 1 for r in all_rows) else "")
     out = [
         "<!DOCTYPE html>",
         '<html lang="en"><head><meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width,initial-scale=1">',
-        f"<title>{_e(ttl)}</title><style>{CSS}</style></head><body>",
+        f"<title>{_e(ttl)}</title><style>{css}</style></head><body>",
         f"<h1>{_e(ttl)}</h1>",
         f'<p class="muted">{len(all_rows)} rows. Charts: X = context per user, one line per concurrency. '
         "Hover a point for the exact value. Self-contained file: no scripts, no network assets.</p>",
@@ -687,7 +783,8 @@ def render_html(
         out.append('<p class="note">Compare view: ' + ", ".join(
             f"<b>{_e(lab)}</b> ({'solid' if i == 0 else 'dashed'})" for i, (lab, _) in enumerate(runs)) + ".</p>")
     out.append("<h2>Charts</h2>")
-    out.append(_legend(users_order, [lab for lab, _ in runs]))
+    n_rep = max((r.repeats or 1 for r in all_rows), default=1)
+    out.append(_legend(users_order, [lab for lab, _ in runs], repeats=n_rep))
     if not spec_on:
         out.append('<p class="note">No speculative decoding in this run: the accepted-drafts and hit-rate charts '
                    "are skipped.</p>")
@@ -713,14 +810,17 @@ def render_html(
                    + _e(", ".join(sorted({PROMPT_LABELS.get(r.prompt_type, r.prompt_type) for r in rows})))
                    + "). Flagged and invalid rows are excluded, so a cell where any prompt type was flagged or "
                    "failed is not averaged over fewer types: its card says which type was excluded and why. Each card "
-                   "also lists every prompt type's own steps/s and tok/s.</p>")
+                   "also lists every prompt type's own steps/s and tok/s."
+                   + (" With repeats, each value is a median; '(a to b, n=N)' runs from the mean of the per-type "
+                      "minima to the mean of the maxima." if n_rep > 1 else "") + "</p>")
         out.append(averages_cards(avg_table))
         for lm in sorted({r.load_mode for r in avg_rows}):
             mode_rows = [r for r in avg_rows if r.load_mode == lm]
             mode_types = " · ".join(_type_label(t) for t in sorted(
                 {r.prompt_type for r in rows if r.load_mode == lm and r.prompt_type != AVG_LABEL}))
             out.append(f"<h3>{_e(group_label(AVG_LABEL, lm))} ({_e(mode_types)})</h3>")
-            out.append(_legend(users_order, [], f"each line = average of {mode_types} for that user count"))
+            out.append(_legend(users_order, [], f"each line = average of {mode_types} for that user count",
+                               repeats=n_rep))
             out.append('<div class="grid">')
             for field, mtitle, unit, scale, needs_spec in METRICS:
                 if needs_spec and not spec_on:
