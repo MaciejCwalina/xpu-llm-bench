@@ -316,9 +316,22 @@ QUIESCE_POLL_S = 0.25  # /metrics poll interval while waiting for the server to 
 class WindowSamples:
     running: list[float] = field(default_factory=list)
     waiting: list[float] = field(default_factory=list)
+    # running + waiting read from the same scrape; maxima of the two lists come from different moments.
+    busy: list[float] = field(default_factory=list)
     kv_pct: list[float] = field(default_factory=list)
     rss: dict[str, int] = field(default_factory=dict)
     other_stacks: set[str] = field(default_factory=set)
+
+
+def concurrent_client(busy_before: float, samples: WindowSamples, sessions: int) -> bool:
+    """Another client shares the server: still busy after the pre-window wait, or more requests than ours at once.
+
+    Uses running + waiting from the same scrape. Adding max(running) to max(waiting) double-counts our own
+    requests: at the start of a closed window some of them are queued (waiting), later all of them run.
+    """
+    if busy_before > 0:
+        return True
+    return bool(samples.busy) and max(samples.busy) > sessions
 
 
 class WindowSampler:
@@ -346,10 +359,13 @@ class WindowSampler:
         while not self._stop.is_set():
             try:
                 snap = parse_prometheus(self.fetch())
-                for key, dst in ((self.names.running, self.samples.running), (self.names.waiting, self.samples.waiting)):
-                    v = metric_value(snap, key)
+                running = metric_value(snap, self.names.running)
+                waiting = metric_value(snap, self.names.waiting)
+                for v, dst in ((running, self.samples.running), (waiting, self.samples.waiting)):
                     if v is not None:
                         dst.append(v)
+                if running is not None or waiting is not None:
+                    self.samples.busy.append((running or 0.0) + (waiting or 0.0))
                 kv = kv_usage_pct(snap, self.names)
                 if kv is not None:
                     self.samples.kv_pct.append(kv)
@@ -1213,8 +1229,7 @@ class Runner:
             flags.append("PREEMPTED")
         running_max = max(samples.running) if samples.running else None
         waiting_max = max(samples.waiting) if samples.waiting else None
-        # busy_before: still running/waiting after the pre-window quiescence wait.
-        if busy_before > 0 or (running_max or 0) + (waiting_max or 0) > len(rung.decoding_sessions):
+        if concurrent_client(busy_before, samples, len(rung.decoding_sessions)):
             flags.append("CONCURRENT_CLIENT")
         if samples.other_stacks:
             flags.append("FOREIGN_STACK")

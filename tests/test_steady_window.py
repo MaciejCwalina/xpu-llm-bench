@@ -163,3 +163,16 @@ def test_rows_carry_steady_fields(mock_server, tmp_path: Path) -> None:
             assert r.decode_tok_s_per_user_steady is None and r.decode_tok_s_total_steady is None
         else:
             assert r.decode_tok_s_total_steady == pytest.approx(r.decode_tok_s_per_user_steady * r.users, rel=0.01)
+
+
+def test_concurrent_client_uses_same_scrape_sum():
+    from xpu_llm_bench.runner import WindowSamples, concurrent_client
+
+    # 4 sessions: 2 queued at the start, then all 4 running. Separate maxima would give 4 + 2 = 6 > 4.
+    ours_only = WindowSamples(running=[2.0, 4.0, 4.0], waiting=[2.0, 0.0, 0.0], busy=[4.0, 4.0, 4.0])
+    assert not concurrent_client(0.0, ours_only, 4)
+    # A fifth request at the same moment is another client.
+    foreign = WindowSamples(running=[4.0, 5.0], waiting=[0.0, 0.0], busy=[4.0, 5.0])
+    assert concurrent_client(0.0, foreign, 4)
+    # Still busy after the pre-window wait.
+    assert concurrent_client(1.0, ours_only, 4)
