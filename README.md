@@ -227,7 +227,7 @@ Each rung records:
 - **Speed:** prefill tok/s, TTFT, TPOT, ITL p50/p95/p99, end-to-end latency, queue time
 - **Server state:** running/waiting (mean and max), prefix-cache hit rate, KV usage %, preemptions
 - **Host memory:** MemAvailable minimum, RSS of the API server, engine and each TP worker, and any other resident vLLM stack
-- **What actually ran:** the attention path, graphs, k and KV dtype, read from server logs rather than flags, plus a build fingerprint (image id + hash of every mount)
+- **What actually ran:** the attention path, graphs, k and KV dtype, read from server logs rather than flags, plus a build fingerprint (image id + hash of every mount; model weights are listed by name + size, never read)
 - **Seed:** the fixed prompt seed
 - **Quality:** logprob vs a dense baseline, MTP on/off greedy divergence, needle, code-edit unit test, format/repetition
 - **Outcome:** an exit reason (`RAM_FLOOR` / `OOM` / `SPEC_ASSERT` / `ENGINE_ERROR` / `CTX_CEILING`) and flags

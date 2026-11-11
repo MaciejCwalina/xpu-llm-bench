@@ -30,7 +30,12 @@ from typing import Any
 from xpu_llm_bench import bootlog, hostinfo, launch, procmem
 from xpu_llm_bench.client import OpenAICompatClient, StreamResult
 from xpu_llm_bench.container import ContainerAdapter
-from xpu_llm_bench.fingerprint import Fingerprint, collect_fingerprint, verify_expected
+from xpu_llm_bench.fingerprint import (
+    Fingerprint,
+    collect_fingerprint,
+    hash_fingerprint_mounts,
+    verify_expected,
+)
 from xpu_llm_bench.gpu_mem import collect_gpu_mem
 from xpu_llm_bench.hold import BenchHold, quiet_hold_active
 from xpu_llm_bench.hostexec import HostExec
@@ -567,14 +572,17 @@ class Runner:
         res = self.exec.run(["docker", "logs", "--timestamps", "--tail", str(tail), name], timeout=60)
         return res.stdout + res.stderr
 
-    def _fingerprint(self) -> Fingerprint | None:
+    def _fingerprint(self, hash_mounts: bool = True) -> Fingerprint | None:
+        """docker inspect of the test container. ``hash_mounts=False`` skips the
+        mount hashing (validation and the per-rung reboot check need only state,
+        ports and StartedAt)."""
         if self._fingerprint_fn:
             return self._fingerprint_fn()
         name = self.spec.server.container_name
         if not name:
             return None
         try:
-            return collect_fingerprint(self.exec, name)
+            return collect_fingerprint(self.exec, name, hash_mounts=hash_mounts)
         except Exception as exc:  # noqa: BLE001
             fp = Fingerprint(name, None, None, None, [], None)
             fp.problems.append(f"docker inspect failed: {exc!r}"[:300])
@@ -1170,7 +1178,7 @@ class Runner:
             exit_reason = "SPEC_ASSERT"
 
         # Rebooted mid-run?
-        fp_now = self._fingerprint()
+        fp_now = self._fingerprint(hash_mounts=False)
         if self.fp and fp_now and fp_now.started_at and self.fp.started_at and fp_now.started_at != self.fp.started_at:
             flags.append("REBOOTED")
 
@@ -1309,7 +1317,7 @@ class Runner:
                 log_lines = bootlog.lines_since(self._logs_text(), since - 1.0)
             except Exception:  # noqa: BLE001
                 log_lines = []
-        fp_now = None if ram_floor else self._fingerprint()
+        fp_now = None if ram_floor else self._fingerprint(hash_mounts=False)
         fail = bootlog.classify_failure(
             log_lines, errors, timed_out=timed_out, ram_floor_hit=ram_floor,
             oom_killed=bool(fp_now and fp_now.oom_killed), patterns=self.spec.log_patterns,
@@ -1388,7 +1396,8 @@ class Runner:
             return rungs
         if problems:  # stop before touching docker or the host
             raise RunRefused("\n".join(problems), manifest)
-        self.fp = self._fingerprint()
+        # Inspect only: mounts are hashed after every check has passed (_hash_mounts).
+        self.fp = self._fingerprint(hash_mounts=False)
         fp = self.fp
         if self.require_container:
             name = self.spec.server.container_name
@@ -1477,6 +1486,21 @@ class Runner:
             manifest.hardware.host_ram_gib = manifest.host["host_ram_gib"]  # measured MemTotal
         return rungs
 
+    def _hash_mounts(self, manifest: RunManifest) -> None:
+        """Build fingerprint, after validation. Never reads model weights (large
+        and weight-type files are listed by name + size); a failure is a
+        fingerprint problem, never a reason not to run."""
+        fp = self.fp
+        if fp is None or fp.build_fingerprint is not None or not fp.container_id:
+            return
+        t0 = time.time()
+        try:
+            hash_fingerprint_mounts(self.exec, fp)
+        except Exception as exc:  # noqa: BLE001
+            fp.problems.append(f"mount hashing failed: {exc!r}"[:300])
+        self._runlog(f"build fingerprint: {len(fp.mounts)} mount(s) hashed in {time.time() - t0:.1f}s")
+        manifest.fingerprint = fp.to_dict()
+
     def _server_max_model_len(self) -> tuple[int | None, str | None]:
         """max_model_len from /v1/models (vLLM), else from the boot log."""
         try:
@@ -1563,6 +1587,8 @@ class Runner:
                 self._check_pre_run_load(manifest)
         except (SafetyError, RunRefused) as exc:
             raise self._refuse(manifest, exc) from None
+        if not self.dry_run:
+            self._hash_mounts(manifest)
         self._write_manifest(manifest)
         if not self.dry_run:
             for warn in self.preflight_warnings:

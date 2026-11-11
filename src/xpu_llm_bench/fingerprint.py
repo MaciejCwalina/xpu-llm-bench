@@ -1,5 +1,8 @@
 """Build fingerprint: image ID + sha256 of every mounted patch file, from docker inspect.
 
+Model weights are never read: weight-type files and files over 16 MiB are
+listed by name + size, whatever the mount path.
+
 All test containers on the bench host may share one local image (no RepoDigest) and differ
 only by bind mounts, so the image ID alone does not identify a build.
 Everything here is read-only: ``docker inspect`` and ``sha256sum``.
@@ -82,19 +85,51 @@ def redact_env(env: list[str]) -> list[str]:
     return out
 
 
+# Never read model weights, whatever the mount path: files with these
+# extensions, or bigger than CONTENT_HASH_MAX_BYTES, are listed by name + size.
+WEIGHT_EXTS = (".safetensors", ".bin", ".gguf", ".pt", ".pth", ".ckpt", ".onnx", ".msgpack", ".h5", ".npz")
+CONTENT_HASH_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _find_tests() -> tuple[str, str]:
+    """(prune expression, "large or weight file" expression) for find(1)."""
+    prune = (
+        r"\( -name .git -o -name __pycache__ -o \( -type d -name blobs \( -path '*/models--*' "
+        r"-o -path '*/datasets--*' -o -path ./blobs \) \) \) -prune"
+    )
+    kib = CONTENT_HASH_MAX_BYTES // 1024
+    names = " -o ".join(f"-iname '*{e}'" for e in WEIGHT_EXTS)
+    big = rf"\( -size +{kib}k -o {names} \)"
+    return prune, big
+
+
 def _hash_script(src: str, skip_content: bool) -> str:
     q = shlex.quote(src)
     if skip_content:
-        # Weights: name + size listing only (hashing tens of GB is not worth it).
+        # Weights destinations: name + size listing only.
         return (
             f"if [ -d {q} ]; then cd {q} && find . -type f -printf '%P %s\\n' | LC_ALL=C sort | sha256sum; "
             f"elif [ -f {q} ]; then stat -c '%n %s' {q} | sha256sum; else echo MISSING; fi"
         )
-    return (
-        f"if [ -f {q} ]; then sha256sum < {q}; "
-        f"elif [ -d {q} ]; then cd {q} && find . -type f ! -path '*/__pycache__/*' ! -path './.git/*' -print0 "
-        f"| LC_ALL=C sort -z | xargs -0 -r sha256sum | sha256sum; else echo MISSING; fi"
+    prune, big = _find_tests()
+    names = " -o ".join(f"-iname '*{e}'" for e in WEIGHT_EXTS)
+    kib = CONTENT_HASH_MAX_BYTES // 1024
+    # A single file: content hash only when small and not a weight type.
+    single = (
+        f"if [ -n \"$(find {q} -maxdepth 0 \\( -size +{kib}k -o {names} \\) -print)\" ]; "
+        f"then stat -L -c 'size:%s' {q} | sha256sum; else sha256sum < {q}; fi"
     )
+    # A directory: one metadata-only find pass lists large / weight files by
+    # name + size (and symlinks by target, e.g. HF snapshots -> blobs/<sha>);
+    # a second pass content-hashes the remaining small files. Lines are merged
+    # in path order, so a tree of small files hashes as before.
+    tree = (
+        f"cd {q} && {{ find . {prune} -o -type l -printf 'link:%l  ./%P\\n' "
+        f"-o -type f {big} -printf 'size:%s  ./%P\\n'; "
+        f"find . {prune} -o -type f ! {big} -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum; }} "
+        f"| LC_ALL=C sort -t ' ' -k3 | sha256sum"
+    )
+    return f"if [ -f {q} ]; then {single}; elif [ -d {q} ]; then {tree}; else echo MISSING; fi"
 
 
 def hash_mount(exec_: HostExec, src: str, skip_content: bool) -> tuple[str | None, str]:
@@ -110,6 +145,7 @@ def collect_fingerprint(
     container: str,
     skip_content_dest: tuple[str, ...] = DEFAULT_SKIP_CONTENT,
     inspect_json: str | None = None,
+    hash_mounts: bool = True,
 ) -> Fingerprint:
     assert_container_allowed(container)
     if inspect_json is None:
@@ -121,7 +157,7 @@ def collect_fingerprint(
         inspect_json = res.stdout
     data = json.loads(inspect_json)
     info = data[0] if isinstance(data, list) else data
-    return fingerprint_from_inspect(exec_, container, info, skip_content_dest)
+    return fingerprint_from_inspect(exec_, container, info, skip_content_dest, hash_mounts=hash_mounts)
 
 
 def fingerprint_from_inspect(
@@ -129,7 +165,11 @@ def fingerprint_from_inspect(
     container: str,
     info: dict[str, Any],
     skip_content_dest: tuple[str, ...] = DEFAULT_SKIP_CONTENT,
+    hash_mounts: bool = True,
 ) -> Fingerprint:
+    """Fingerprint from docker inspect. ``hash_mounts=False`` is inspect-only
+    (container state, ports, cmd/env): mounts stay "unhashed" and
+    build_fingerprint is None until :func:`hash_fingerprint_mounts` runs."""
     from xpu_llm_bench.launch import launch_from_inspect, redact_argv
     from xpu_llm_bench.safety import bound_host_ports
 
@@ -158,23 +198,43 @@ def fingerprint_from_inspect(
         if m.get("Type") not in (None, "bind"):
             fp.mounts.append(MountHash(src, dest, str(m.get("Type")), None))
             continue
-        skip = any(dest == d or dest.startswith(d.rstrip("/") + "/") for d in skip_content_dest)
-        if exec_ is None:
-            fp.mounts.append(MountHash(src, dest, "unhashed", None))
+        fp.mounts.append(MountHash(src, dest, "unhashed", None))
+    lh = hashlib.sha256()
+    lh.update(json.dumps({"cmd": fp.cmd, "env": sorted(fp.env)}, sort_keys=True).encode())
+    fp.launch_fingerprint = lh.hexdigest()
+    if exec_ is None:
+        _build_fingerprint(fp)
+    elif hash_mounts:
+        hash_fingerprint_mounts(exec_, fp, skip_content_dest)
+    return fp
+
+
+def hash_fingerprint_mounts(
+    exec_: HostExec, fp: Fingerprint, skip_content_dest: tuple[str, ...] = DEFAULT_SKIP_CONTENT
+) -> Fingerprint:
+    """Hash the bind mounts of an inspect-only fingerprint and set build_fingerprint.
+
+    Weights are never read: large files and weight types are listed by name
+    and size only (see :func:`_hash_script`)."""
+    for mh in fp.mounts:
+        if mh.kind != "unhashed":
             continue
-        digest, kind = hash_mount(exec_, src, skip)
+        dest = mh.destination
+        skip = any(dest == d or dest.startswith(d.rstrip("/") + "/") for d in skip_content_dest)
+        digest, kind = hash_mount(exec_, mh.source, skip)
         if digest is None:
-            fp.problems.append(f"could not hash mount {src} -> {dest}")
-        fp.mounts.append(MountHash(src, dest, kind, digest))
+            fp.problems.append(f"could not hash mount {mh.source} -> {dest}")
+        mh.kind, mh.sha256 = kind, digest
+    _build_fingerprint(fp)
+    return fp
+
+
+def _build_fingerprint(fp: Fingerprint) -> None:
     h = hashlib.sha256()
     h.update((fp.image_id or "no-image-id").encode())
     for mh in fp.mounts:
         h.update(f"\n{mh.destination}\t{mh.kind}\t{mh.sha256}".encode())
     fp.build_fingerprint = h.hexdigest()
-    lh = hashlib.sha256()
-    lh.update(json.dumps({"cmd": fp.cmd, "env": sorted(fp.env)}, sort_keys=True).encode())
-    fp.launch_fingerprint = lh.hexdigest()
-    return fp
 
 
 # ---------------------------------------------------------------------------
