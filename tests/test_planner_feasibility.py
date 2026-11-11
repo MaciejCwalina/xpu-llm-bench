@@ -146,7 +146,7 @@ def test_plan_cli_never_fails_on_estimates(tmp_path: Path, capsys) -> None:
 
 
 def test_live_preflight_records_mem_but_estimate_never_refuses(mock_server, tmp_path: Path) -> None:
-    from xpu_llm_bench.ram import LocalMemInfo, RamFloorError
+    from xpu_llm_bench.ram import LocalMemInfo
 
     spec = _spec(mock_server["base"])
     spec.hardware.mem_available_floor_gib = 2.0
@@ -161,12 +161,12 @@ def test_live_preflight_records_mem_but_estimate_never_refuses(mock_server, tmp_
     assert man.launch_check["feasibility"]["mem_available_gib"] == pytest.approx(3.0, abs=0.01)
     assert any(n.startswith("INFO host RAM estimate (never blocks)") for n in man.notes)
 
-    # A live reading already under the floor is not an estimate: the runtime
-    # floor guard still stops before the first rung.
+    # A live reading already under the floor is a warning too: the run starts,
+    # and each user count that hits the floor stops there (CTX_CEILING).
     mem.write_text("MemAvailable: 2050000 kB\n")
     r2 = _runner(spec, tmp_path / "o2", mock_server, tmp_path)
     r2.ram_source = LocalMemInfo(str(mem))
-    before = mock_server["state"].chat_requests
-    with pytest.raises(RamFloorError):
-        r2.run()
-    assert mock_server["state"].chat_requests == before
+    man2 = r2.run()
+    assert man2.status == "completed" and not man2.abort_reason
+    assert any("under the floor before the first rung" in n for n in man2.notes)
+    assert not man2.ctx_ceilings  # the floor guard is off for this run, every rung measured

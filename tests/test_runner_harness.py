@@ -189,15 +189,21 @@ class Dropping(RamSource):
         return self.seq.pop(0) if len(self.seq) > 1 else self.seq[0]
 
 
-def test_ram_floor_mid_run_is_a_row_flag_and_resumable(mock_server, tmp_path: Path) -> None:
+def test_ram_floor_mid_run_is_a_ceiling_and_never_aborts(mock_server, tmp_path: Path) -> None:
     spec = _spec(mock_server["base"], hardware={"mem_available_floor_gib": 2.0})
-    # plenty at preflight and start, then 1.5 GiB
+    # plenty at preflight and start, then 1.5 GiB for good
     src = Dropping([8 * 1024 * 1024, 8 * 1024 * 1024, 1536 * 1024])
     man = _runner(spec, tmp_path / "o", mock_server, tmp_path, ram_source=src).run()
-    assert man.status == "aborted" and man.abort_reason.startswith("RAM_FLOOR")
+    assert man.status == "completed" and not man.abort_reason
     rows = read_jsonl(tmp_path / "o" / "results.jsonl")
-    assert rows[-1].exit_reason == "RAM_FLOOR" and "RAM_FLOOR" in rows[-1].flags
-    assert rows[-1].mem_available_min_gib is not None and rows[-1].mem_available_min_gib < 2.0
+    floor_rows = [r for r in rows if r.exit_reason == "RAM_FLOOR"]
+    assert floor_rows and all("CTX_CEILING" in r.flags and "RAM_FLOOR" in r.flags for r in floor_rows)
+    assert floor_rows[0].mem_available_min_gib is not None and floor_rows[0].mem_available_min_gib < 2.0
+    # that user count stopped at its ceiling; RAM never recovered, so the guard
+    # went off and the later user counts still ran: the run finished
+    assert len(man.ctx_ceilings) == 1 and {v["reason"] for v in man.ctx_ceilings.values()} == {"ram_floor"}
+    assert any("still under the floor" in n and "guard off" in n for n in man.notes)
+    assert any(r.users == 4 and r.valid != "invalid" for r in rows)
 
 
 def test_dry_run_makes_no_requests_and_flags_rows(mock_server, tmp_path: Path) -> None:

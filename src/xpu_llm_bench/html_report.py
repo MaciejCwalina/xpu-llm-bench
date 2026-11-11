@@ -74,6 +74,14 @@ pre{white-space:pre-wrap;word-break:break-all;background:var(--card);padding:8px
 .note{background:var(--card);border-left:3px solid var(--muted);padding:6px 10px;margin:6px 0}
 .wide{overflow-x:auto}
 .qline{font-size:13px;margin:2px 0 8px}.qline b{font-weight:600}
+.acards{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin:8px 0 14px}
+.acard{background:var(--card);border-radius:8px;padding:8px 10px;border-top:3px solid var(--muted)}
+.acard.partial{opacity:.85;border-top-style:dashed}
+.ac-h{font-weight:600;font-size:13px}.ac-of{font-size:11px;color:var(--muted);margin:1px 0 4px}
+.ac-big{display:flex;gap:14px;margin:2px 0}.ac-big div{display:flex;flex-direction:column}
+.ac-big b{font-size:20px;line-height:1.1}.ac-big span{font-size:10px;color:var(--muted)}
+.ac-small{font-size:11px;margin:3px 0 4px}
+.ac-t{font-size:11px;width:100%}.ac-t td,.ac-t th{padding:1px 4px}
 svg .ceil{stroke:var(--bad);stroke-width:2}
 """
 
@@ -317,8 +325,8 @@ def svg_chart(
     return head + "".join(parts) + "</div>"
 
 
-def _legend(users_order: list[int], labels: list[str]) -> str:
-    items = []
+def _legend(users_order: list[int], labels: list[str], caption: str | None = None) -> str:
+    items = [f"<span><b>{_e(caption)}</b></span>"] if caption else []
     for i, u in enumerate(users_order):
         items.append(f'<span><svg width="22" height="10"><line x1="0" x2="22" y1="5" y2="5" stroke="{_color(i)}" '
                      f'stroke-width="3"/></svg>{u} user{"s" if u != 1 else ""}</span>')
@@ -358,58 +366,120 @@ def _clean(r: RungResult) -> bool:
     return r.valid == "valid" and not r.flags
 
 
+def _type_label(pt: str) -> str:
+    return PROMPT_LABELS.get(pt, pt.replace("_", " ").capitalize())
+
+
+def _exclusion_reason(rs: list[RungResult]) -> str:
+    """Why a prompt type's rows at one (users, context) cell are left out of the average."""
+    if not rs:
+        return "no row"
+    bits = []
+    for r in rs:
+        if r.valid != "valid" and r.valid != "warning":
+            bits.append(f"invalid ({r.exit_reason or 'failed'})")
+        if r.flags:
+            bits.append("flagged " + ", ".join(r.flags))
+        elif r.valid == "warning":
+            bits.append("warning row")
+    return "; ".join(dict.fromkeys(bits)) or "not clean"
+
+
 def average_rows(rows: list[RungResult]) -> tuple[list[RungResult], list[dict[str, Any]]]:
     """Average clean rows across prompt types, per load mode, users and context.
 
     Only (load mode, users, context) cells where EVERY prompt type of that load
-    mode has a clean row are averaged. Returns synthetic rows (prompt_type
-    "average", for the chart group) and table records."""
+    mode has a clean row are averaged (``averaged`` true). Cells where at least
+    one type is clean but another is not are returned too (``averaged`` false)
+    with the excluded types and why, so the report can name them; they are not
+    averaged. Returns synthetic rows for the averaged cells (prompt_type
+    "average", for the chart group) and one record per cell."""
     types_by_mode: dict[str, set[str]] = defaultdict(set)
     for r in rows:
         if r.prompt_type != AVG_LABEL:
             types_by_mode[r.load_mode].add(r.prompt_type)
-    cells: dict[tuple[str, int, int], dict[str, list[RungResult]]] = defaultdict(lambda: defaultdict(list))
+    every: dict[tuple[str, int, int], dict[str, list[RungResult]]] = defaultdict(lambda: defaultdict(list))
     for r in rows:
-        if _clean(r) and r.prompt_type != AVG_LABEL:
-            cells[(r.load_mode, r.users, r.ctx_per_user)][r.prompt_type].append(r)
+        if r.prompt_type != AVG_LABEL:
+            every[(r.load_mode, r.users, r.ctx_per_user)][r.prompt_type].append(r)
     avg_rows: list[RungResult] = []
     table: list[dict[str, Any]] = []
-    for (mode, users, ctx), by_type in sorted(cells.items()):
-        types = types_by_mode[mode]
-        if len(types) < 2 or set(by_type) != types:
+    for (mode, users, ctx), all_by_type in sorted(every.items()):
+        types = sorted(types_by_mode[mode])
+        if len(types) < 2:
             continue
-        rec: dict[str, Any] = {"load_mode": mode, "users": users, "ctx": ctx, "types": sorted(types)}
+        clean = {t: [x for x in all_by_type.get(t, []) if _clean(x)] for t in types}
+        clean = {t: rs for t, rs in clean.items() if rs}
+        if not clean:
+            continue
+        excluded = {t: _exclusion_reason(all_by_type.get(t, [])) for t in types if t not in clean}
+        per_type: dict[str, dict[str, float | None]] = {}
+        for t, rs in clean.items():
+            per_type[t] = {}
+            for field, _title, _scale in AVG_METRICS:
+                nums = [float(getattr(x, field)) for x in rs if isinstance(getattr(x, field), (int, float))]
+                per_type[t][field] = sum(nums) / len(nums) if nums else None
+        averaged = not excluded
+        rec: dict[str, Any] = {"load_mode": mode, "users": users, "ctx": ctx, "types": types,
+                               "averaged": averaged, "breakdown": per_type, "excluded": excluded}
         vals: dict[str, float | None] = {}
         for field, _title, _scale in AVG_METRICS:
-            per_type = []
-            for t in sorted(types):
-                nums = [float(getattr(x, field)) for x in by_type[t] if isinstance(getattr(x, field), (int, float))]
-                if nums:
-                    per_type.append(sum(nums) / len(nums))
-            vals[field] = sum(per_type) / len(per_type) if len(per_type) == len(types) else None
+            got = [per_type[t][field] for t in types if t in per_type and per_type[t][field] is not None]
+            vals[field] = sum(got) / len(got) if averaged and len(got) == len(types) else None
         rec.update(vals)
         table.append(rec)
-        avg_rows.append(RungResult.model_construct(
-            run_id="average", rung_id=f"average of {len(types)} prompt types:{mode}:{users}u:{ctx}",
-            users=users, ctx_per_user=ctx, ctx_tokens=[], prompt_type=AVG_LABEL, load_mode=mode,
-            flags=[], valid="valid", exit_reason=None, **vals,
-        ))
+        if averaged:
+            avg_rows.append(RungResult.model_construct(
+                run_id="average",
+                rung_id=f"average of {' · '.join(_type_label(t) for t in types)} ({users}u, {ctx_label(ctx)})",
+                users=users, ctx_per_user=ctx, ctx_tokens=[], prompt_type=AVG_LABEL, load_mode=mode,
+                flags=[], valid="valid", exit_reason=None, **vals,
+            ))
     return avg_rows, table
 
 
-def averages_table(table: list[dict[str, Any]]) -> str:
+def _avg_val(v: float | None, scale: float = 1.0) -> str:
+    return _fmt(v * scale) if isinstance(v, (int, float)) else "n/a"
+
+
+def averages_cards(table: list[dict[str, Any]]) -> str:
+    """One compact card per (load mode, users, context) cell."""
     if not table:
-        return ('<p class="muted">No (users, context) cell has a clean row in every prompt type, so there is '
-                "nothing to average.</p>")
-    head = "<th>load</th><th>users</th><th>context</th>" + "".join(f"<th>{_e(t)}</th>" for _, t, _ in AVG_METRICS)
-    body = []
+        return '<p class="muted">No (users, context) cell has a clean row, so there is nothing to average.</p>'
+    cards = []
     for rec in table:
-        cells = [LOAD_LABELS.get(rec["load_mode"], rec["load_mode"]), str(rec["users"]), ctx_label(rec["ctx"])]
-        for field, _t, scale in AVG_METRICS:
-            v = rec.get(field)
-            cells.append(_fmt(v * scale) if isinstance(v, (int, float)) else "n/a")
-        body.append("<tr>" + "".join(f"<td>{_e(c)}</td>" for c in cells) + "</tr>")
-    return f'<div class="wide"><table><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
+        users, ctx, types = rec["users"], rec["ctx"], rec["types"]
+        head = (f'<div class="ac-h">{users} user{"s" if users != 1 else ""} · {_e(ctx_label(ctx))}'
+                f'<span class="muted"> · {_e(LOAD_LABELS.get(rec["load_mode"], rec["load_mode"]))}</span></div>')
+        if rec["averaged"]:
+            of = "Avg of " + " · ".join(_type_label(t) for t in types)
+            big = (f'<div class="ac-big"><div><b>{_avg_val(rec["steps_s_per_user"])}</b><span>steps/s per user</span>'
+                   f'</div><div><b>{_avg_val(rec["decode_tok_s_per_user"])}</b><span>decode tok/s per user</span>'
+                   "</div></div>")
+            small = (f'<div class="ac-small">drafts/step {_avg_val(rec["accepted_drafts_per_step"])} · '
+                     f'hit rate {_avg_val(rec["hit_rate"], 100.0)}% · TTFT {_avg_val(rec["ttft_ms"])} ms · '
+                     f'prefill {_avg_val(rec["prefill_tok_s"])} tok/s</div>')
+            cls = "acard"
+        else:
+            kept = [t for t in types if t in rec["breakdown"]]
+            of = "Not averaged: " + " · ".join(_type_label(t) for t in kept) + " only"
+            big = '<div class="ac-big muted"><div><b>—</b><span>needs a clean row in every prompt type</span></div></div>'
+            small = ""
+            cls = "acard partial"
+        rows_html = []
+        for t in types:
+            b = rec["breakdown"].get(t)
+            if b is not None:
+                rows_html.append(f'<tr><td>{_e(_type_label(t))}</td><td>{_avg_val(b["steps_s_per_user"])}</td>'
+                                 f'<td>{_avg_val(b["decode_tok_s_per_user"])}</td></tr>')
+            else:
+                rows_html.append(f'<tr class="bad"><td>{_e(_type_label(t))}</td><td colspan="2">excluded: '
+                                 f'{_e(rec["excluded"].get(t, ""))}</td></tr>')
+        breakdown = ('<table class="ac-t"><thead><tr><th>prompt type</th><th>steps/s</th><th>tok/s</th></tr></thead>'
+                     f'<tbody>{"".join(rows_html)}</tbody></table>')
+        cards.append(f'<div class="{cls}" data-users="{users}" data-ctx="{ctx}">{head}'
+                     f'<div class="ac-of">{_e(of)}</div>{big}{small}{breakdown}</div>')
+    return f'<div class="acards">{"".join(cards)}</div>'
 
 
 def has_spec_decode(rows: list[RungResult], manifest: RunManifest | None) -> bool:
@@ -638,15 +708,20 @@ def render_html(
     avg_rows, avg_table = average_rows(rows)
     if len({r.prompt_type for r in rows}) > 1:
         out.append("<h2>Averages across prompt types</h2>")
-        out.append('<p class="note">Mean of the per-prompt-type values for each load mode, user count and context '
-                   "rung that has a clean row in every prompt type ("
+        out.append('<p class="note">Each card: the mean of the per-prompt-type values for one load mode, user count '
+                   "and context rung that has a clean row in every prompt type ("
                    + _e(", ".join(sorted({PROMPT_LABELS.get(r.prompt_type, r.prompt_type) for r in rows})))
                    + "). Flagged and invalid rows are excluded, so a cell where any prompt type was flagged or "
-                   "failed is left out rather than averaged over fewer types.</p>")
-        out.append(averages_table(avg_table))
+                   "failed is not averaged over fewer types: its card says which type was excluded and why. Each card "
+                   "also lists every prompt type's own steps/s and tok/s.</p>")
+        out.append(averages_cards(avg_table))
         for lm in sorted({r.load_mode for r in avg_rows}):
             mode_rows = [r for r in avg_rows if r.load_mode == lm]
-            out.append(f"<h3>{_e(group_label(AVG_LABEL, lm))}</h3><div class=\"grid\">")
+            mode_types = " · ".join(_type_label(t) for t in sorted(
+                {r.prompt_type for r in rows if r.load_mode == lm and r.prompt_type != AVG_LABEL}))
+            out.append(f"<h3>{_e(group_label(AVG_LABEL, lm))} ({_e(mode_types)})</h3>")
+            out.append(_legend(users_order, [], f"each line = average of {mode_types} for that user count"))
+            out.append('<div class="grid">')
             for field, mtitle, unit, scale, needs_spec in METRICS:
                 if needs_spec and not spec_on:
                     continue

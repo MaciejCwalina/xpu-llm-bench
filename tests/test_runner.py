@@ -130,7 +130,7 @@ def test_dry_run_writes_rows_without_http(tmp_path: Path) -> None:
     assert all(r.reason == "dry-run" for r in rows)
 
 
-def test_ram_floor_aborts_and_is_resumable(tmp_path: Path) -> None:
+def test_ram_under_floor_at_start_is_a_warning_only(tmp_path: Path) -> None:
     mem = tmp_path / "meminfo"
     mem.write_text("MemAvailable: 1024 kB\n")  # well under 2 GiB, and under 0.001? 1024 KiB is 0.001 GiB exactly... 1024 KiB = 1/1024 GiB ≈ 0.00098
     spec = _spec("http://127.0.0.1:1")
@@ -141,12 +141,7 @@ def test_ram_floor_aborts_and_is_resumable(tmp_path: Path) -> None:
         hold=BenchHold(command="/bin/true", dry_run=True),
         ram_source=LocalMemInfo(str(mem)),
     )
-    import pytest
-
-    from xpu_llm_bench.ram import RamFloorError
-
-    with pytest.raises(RamFloorError):
-        runner.run()
+    runner.run()  # no abort: a warning and a manifest note
     manifest = RunManifest.load(tmp_path / "abort" / "dry-run" / "manifest.json")
-    assert manifest.status == "aborted"
-    assert "floor" in (manifest.abort_reason or "").lower()
+    assert manifest.status == "dry_run" and not manifest.abort_reason
+    assert any("under the floor before the first rung" in n for n in manifest.notes)

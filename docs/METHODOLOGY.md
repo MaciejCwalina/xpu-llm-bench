@@ -12,7 +12,7 @@ progressive ladder and the true hit-rate definition below.
 | Refuse protected containers: the built-in `vllm-production`, CI-runner name patterns, `safety.protected_containers`, and the site config's `protected_containers` / `protected_patterns`. Also refuse any container whose `docker inspect` shows a protected host port (port binding or `--port N` under host networking). Site config only adds protection. | `safety`, `site`, `runner._preflight` |
 | The runner never starts, stops, or restarts a container. A container it may *manage* must also carry a test prefix (`vllm-bench-`, `vllm-test-`, `vllm-qsa-`, `vllm-dflash`). | `runner`, `safety.assert_test_container_name` |
 | bench-hold: run `bench-hold status` first. **Refuse if anyone else holds it**, because `acquire` silently overwrites. Also refuse while the optional operator quiet hold (`safety.quiet_hold_file` / site config, read only) is active. Then `acquire <min> <reason> --by <hold_name>`, re-check `status` to confirm ownership, renew (same `--by`) while running, and `release` only if `status` still shows our name. `release` also lets the host's queued GPU work resume. | `hold.BenchHold.guard_and_acquire`, `release_if_ours` |
-| `MemAvailable` (`/proc/meminfo`, locally or over SSH) is sampled every 0.5 s. At or below **2 GiB** the rung aborts with `RAM_FLOOR`, the run stops, and `--resume` continues from the last completed rung. `--ram-wait-min N` waits up to N min for floor + 1 GiB, then retries the rung in-process. | `ram.RamWatcher`, `runner` |
+| `MemAvailable` (`/proc/meminfo`, locally or over SSH) is sampled every 0.5 s. At or below **2 GiB** the rung stops with `RAM_FLOOR` and becomes that user count's `CTX_CEILING`; the run continues with the next user count and never aborts on RAM (with `ladder.stop_at_ceiling: false` the old stop-and-`--resume` behaviour applies). `--ram-wait-min N` waits up to N min for floor + 1 GiB before moving on. Under the floor before the first rung: a warning only (guard off for that run). | `ram.RamWatcher`, `runner` |
 | Never run `xpu-smi`, not even discovery. Every command passes `assert_no_xpu_smi`. GPU facts come from sysfs (`/sys/class/drm/card*/device/{vendor,device,driver}`), `uname`, `/proc`, and `dpkg-query`. | `hostexec`, `hostinfo` |
 | API keys come from the environment only (`endpoint.api_key_env`). Secret-looking env vars are redacted in fingerprints. | `client`, `fingerprint.redact_env` |
 
@@ -66,9 +66,13 @@ fit, and the run records it instead of failing:
   nothing is sent; the row has exit reason `CTX_CEILING`.
 - `server_rejected_context`: the server refuses the request length.
 - `ram_floor` / `oom`: MemAvailable hit the floor or the engine was OOM-killed
-  during the rung. After a RAM-floor ceiling the run continues only once
-  MemAvailable is back above the floor (+0.5 GiB, waiting up to
-  `--ram-wait-min`), otherwise it aborts.
+  during the rung. After a RAM-floor ceiling the run waits up to
+  `--ram-wait-min` for MemAvailable to recover and moves on to the next user
+  count; if RAM did not recover it notes that and turns the floor guard off
+  for the rest of the run. A RAM floor never aborts the run. MemAvailable
+  already under the floor before the first rung is a warning (printed and in
+  `manifest.notes`), not a refusal, and the run goes ahead with the floor
+  guard off (MemAvailable is still sampled per rung).
 The failed rung is flagged `CTX_CEILING`, the manifest records
 `ctx_ceilings["<prompt type>|<load mode>|<users>"] = {max_ok_ctx, stopped_at,
 reason, detail}`, the remaining rungs of that user count are skipped, and the

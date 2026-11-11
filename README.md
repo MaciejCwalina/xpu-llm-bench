@@ -12,7 +12,7 @@ test container; the harness measures it and checks it is what the spec says.
 1. **Clone and install** (Python 3.11+):
 
    ```bash
-   git clone <this repo> xpu-llm-bench && cd xpu-llm-bench
+   git clone https://github.com/Wrapzii/xpu-llm-bench && cd xpu-llm-bench
    python3 -m venv .venv && source .venv/bin/activate
    pip install -e ".[dev]"
    ```
@@ -278,7 +278,7 @@ These rules are enforced in code, and the tests check them:
 - `bench-hold` (optional, when `hold_command` is set): checks `status` first and **refuses if anyone else holds it**, because `acquire` silently overwrites. Also refuses an active operator quiet hold (optional file, from site config). It then acquires under a per-run name (the run id, unless `safety.hold_name` is set), confirms, renews while it still owns the hold, and releases only its own hold. Without a `hold_command` the quiet hold is still honored.
 - Preflight stops (exit 3, manifest `status: refused`) on: no site config, `TODO`/`<...>` spec values, a missing or stopped test container, a variant A/B that would share one endpoint, or a bench-hold held by someone else. GPU and host-RAM **estimates never block** a run, a user count or a bigger ladder; they are printed and noted in the manifest.
 - Pre-run load check: if the server is already busy (`/metrics` running or waiting requests) or the GPU already loaded (tokens generated over ~2 s, KV in use), it warns and asks once (`--yes` skips the question; a non-interactive run proceeds). The starting load goes into the manifest (`pre_run_load`) and every row is flagged `PRE_EXISTING_LOAD`. No process watching.
-- A live `MemAvailable` floor, 2 GiB by default (`hardware.mem_available_floor_gib`), stops the user count that hits it (`CTX_CEILING`, reason `ram_floor`); the run continues only once MemAvailable is back above the floor, otherwise it aborts (`--resume` continues).
+- A live `MemAvailable` floor, 2 GiB by default (`hardware.mem_available_floor_gib`), stops the user count that hits it (`CTX_CEILING`, reason `ram_floor`) and the run moves on to the next user count; it never aborts the run. MemAvailable already under the floor before the first rung is a warning (printed and noted in the manifest), not a refusal: the run goes ahead with the floor guard off (MemAvailable still sampled), and the same happens if RAM does not recover after a RAM-floor ceiling. OOM, KV-capacity and server-rejection ceilings always apply. The only pre-run questions are whether the GPU is already loaded or the server already busy.
 - Never runs `xpu-smi`, not even discovery.
 - API keys come from the environment only.
 

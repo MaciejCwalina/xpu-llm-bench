@@ -159,18 +159,42 @@ def test_averages_across_prompt_types() -> None:
     by = {(t["users"], t["ctx"]): t for t in table}
     # 1 user at 8K: every prompt type clean -> plain mean of the three
     one = [r for r in rows if r.users == 1 and r.ctx_per_user == 8192]
-    assert len(one) == 3
+    assert len(one) == 3 and by[(1, 8192)]["averaged"]
     assert by[(1, 8192)]["decode_tok_s_per_user"] == pytest.approx(sum(r.decode_tok_s_per_user for r in one) / 3)
-    # a cell where any prompt type is flagged or failed is left out
-    assert (2, 32768) not in by  # NOT_AS_LABELED in multi_turn_chat
-    assert (4, 65536) not in by  # QSA_FALLBACK in code_edits
-    assert (8, 8192) not in by  # HIT_RATE_UNKNOWN
-    assert (4, 196608) not in by  # past the ceiling
+    # a cell where any prompt type is flagged or failed is NOT averaged over fewer types
+    for cell, (ptype, why) in {(2, 32768): ("multi_turn_chat", "NOT_AS_LABELED"),
+                               (4, 65536): ("code_edits", "QSA_FALLBACK"),
+                               (8, 8192): ("multi_turn_chat", "HIT_RATE_UNKNOWN")}.items():
+        rec = by[cell]
+        assert not rec["averaged"] and rec["decode_tok_s_per_user"] is None
+        assert why in rec["excluded"][ptype] and ptype not in rec["breakdown"]
+    assert (4, 196608) not in by  # past the ceiling: no clean row anywhere
+    assert len(avg) == sum(t["averaged"] for t in table)
     doc = render_html(rows, man)
     assert "<h2>Averages across prompt types</h2>" in doc and "Flagged and invalid rows are excluded" in doc
-    assert "<h3>Average across prompt types, closed loop</h3>" in doc
-    assert len(avg) == len(table)
+    assert "<h3>Average across prompt types, closed loop (Code edits · Long-form writing · Multi-turn chat)</h3>" in doc
+    assert "each line = average of Code edits · Long-form writing · Multi-turn chat" in doc
 
+
+def test_average_cards_label_prompt_types() -> None:
+    rows, man = _example()
+    doc = render_html(rows, man)
+    sec = doc[doc.index("<h2>Averages across prompt types</h2>"):doc.index("<h2>All numbers</h2>")]
+    assert "<table><thead><tr><th>load</th><th>users</th><th>context</th>" not in sec  # the old table is gone
+    cards = re.findall(r'<div class="acard( partial)?" data-users="(\d+)" data-ctx="(\d+)">(.*?)</tbody></table></div>',
+                       sec, flags=re.S)
+    assert cards
+    full = {(u, c): body for p, u, c, body in cards if not p}
+    part = {(u, c): body for p, u, c, body in cards if p}
+    c18 = full[("1", "8192")]
+    assert "Avg of Code edits · Long-form writing · Multi-turn chat" in c18
+    assert "steps/s per user" in c18 and "decode tok/s per user" in c18
+    assert "drafts/step" in c18 and "hit rate" in c18 and "TTFT" in c18 and "prefill" in c18
+    for name in ("Code edits", "Long-form writing", "Multi-turn chat"):
+        assert f"<tr><td>{name}</td>" in c18  # per-type breakdown row
+    p232 = part[("2", "32768")]
+    assert "Not averaged" in p232 and "excluded: flagged NOT_AS_LABELED" in p232 and "Multi-turn chat" in p232
+    assert "<script" not in doc
 
 def test_flagged_points_are_hollow_with_tooltip() -> None:
     rows, man = _example()

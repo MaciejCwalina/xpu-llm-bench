@@ -1484,11 +1484,18 @@ class Runner:
         try:
             watcher.check_now()
         except RamFloorError as exc:
-            manifest.status = "aborted"
-            manifest.abort_reason = f"RAM_FLOOR before start: {exc}"
-            manifest.finished_utc, manifest.finished_local = stamp_pair()
+            # A warning only: the run starts anyway. A user count that hits the
+            # floor during a rung stops there (CTX_CEILING) and the run moves on.
+            # A floor the host already sits under cannot tell this run's growth
+            # apart, so the RAM floor guard is off for this run (MemAvailable is
+            # still sampled); OOM, KV-capacity and server-rejection ceilings still apply.
+            note = (f"WARN MemAvailable already under the floor before the first rung ({exc}); running anyway "
+                    "with the RAM floor guard off (still sampled); OOM / KV / server ceilings still apply")
+            print(f"WARNING: {note}", file=sys.stderr, flush=True)
+            manifest.notes.append(note)
+            self._runlog(note)
             self._write_manifest(manifest)
-            raise
+            watcher = RamWatcher(floor_gib=0.0, source=watcher.source, interval_s=watcher.interval_s)
 
         if not self.dry_run and self.hold is None:
             try:
@@ -1610,10 +1617,14 @@ class Runner:
                     self._record_ceiling(manifest, rung, why, row.reason or "; ".join(row.errors)[:200])
                     self._runlog(f"ceiling {ckey}: stops at {rung.ctx_per_user} ({why}); continuing with the next user count")
                     if why == "ram_floor":
-                        # Passive protection stays: continue only once RAM is back above the floor.
+                        # Never aborts the run: give RAM a chance to recover (--ram-wait-min),
+                        # note it if it did not, and go on with the next user count.
                         if not self._ram_recovered(watcher):
-                            abort_reason = f"RAM_FLOOR: MemAvailable did not recover after the {ckey} ceiling: {row.reason}"
-                            break
+                            note = (f"WARN MemAvailable still under the floor after the {ckey} ceiling; continuing "
+                                    "with the RAM floor guard off (still sampled)")
+                            manifest.notes.append(note)
+                            self._runlog(note)
+                            watcher.floor_gib = 0.0
                         watcher = self._restart_watcher(watcher)
                     manifest.completed_rung_ids.append(rung.rung_id)
                     self._write_manifest(manifest)
@@ -1797,7 +1808,10 @@ class Runner:
     def _restart_watcher(self, old: RamWatcher) -> RamWatcher:
         old.stop()
         w = RamWatcher(floor_gib=old.floor_gib, source=old.source, interval_s=old.interval_s)
-        w.check_now()
+        try:
+            w.check_now()
+        except RamFloorError:
+            w = RamWatcher(floor_gib=old.floor_gib, source=old.source, interval_s=old.interval_s)
         if not self.dry_run:
             w.start()
         return w
