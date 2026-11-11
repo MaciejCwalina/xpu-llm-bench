@@ -1,0 +1,38 @@
+# Planned MTP-3 run. Identical ladder to the MTP-6 specs; only k changes.
+# Compare against MTP-6 on steps/s and tok/s. The true hit rate is per draft
+# slot, so it is not comparable across different k (bench compare says so).
+name: mtp3
+description: QSA + MTP with k=3 (planned).
+profile: quick
+kind: run
+endpoint:
+  base_url: http://127.0.0.1:8102/v1  # TODO: confirm test-container port (never a protected production port)
+  metrics_url: http://127.0.0.1:8102/metrics
+  health_url: http://127.0.0.1:8102/health
+  api_key_env: OPENAI_API_KEY
+  model: TODO-served-model-name
+server:
+  image: <vllm-xpu-image>:<tag>  # placeholder
+  container_name: vllm-bench-mtp3
+  attention_requested: qsa
+  kv_format: int8_k_int4_v
+  env:
+    K8V4_QSA: "1"
+  graph:
+    mode: FULL_DECODE_ONLY
+    # MTP-3 verify window is k+1 = 4 tokens per sequence: 4, 8, ..., 32 for 1..8 users.
+    capture_sizes: [4, 8, 12, 16, 20, 24, 28, 32]
+  speculative:
+    method: mtp
+    num_speculative_tokens: 3
+  max_num_seqs: 8
+hardware:
+  mem_available_floor_gib: 2
+access:
+  mode: local  # TODO
+safety:
+  hold_name: xpu-llm-bench-mtp3
+  hold_reason: xpu-llm-bench MTP-3 ladder
+prompts:
+  types: [code_edits, long_form, multi_turn_chat]
+  seed: 20261111

@@ -1,0 +1,68 @@
+# Production-shaped dense baseline. Unknown values are marked TODO.
+name: prod-dense-baseline
+description: Dense-attention baseline on the production-shaped image, MTP-6, boot once.
+profile: full
+kind: run
+endpoint:
+  base_url: http://127.0.0.1:8000/v1  # TODO: confirm test-container port
+  metrics_url: http://127.0.0.1:8000/metrics
+  health_url: http://127.0.0.1:8000/health
+  tokenize_url: http://127.0.0.1:8000/tokenize
+  api_key_env: OPENAI_API_KEY
+  model: TODO-served-model-name  # the served model name
+server:
+  image: <vllm-xpu-image>:<tag>  # placeholder; TODO: pin digest
+  image_digest: TODO-image-digest
+  container_name: vllm-bench-dense-baseline
+  source_commit: TODO-server-source-commit
+  manage_container: false  # TODO: set true only when this runner should start the test container
+  attention_requested: dense
+  kv_format: int8_k_int4_v
+  env:
+    K8V4_QSA: "0"
+    # QSA_SHARED: "TODO"
+    # EXACT_TILED: "TODO"
+    # V2_EXACT7: "TODO"
+    # QSA_GRAPH: "TODO"
+  launch_args: []  # TODO: --tensor-parallel-size 2, --max-num-seqs, --gpu-memory-utilization, ...
+  graph:
+    mode: FULL_DECODE_ONLY
+    per_gpu: false
+    capture_sizes: [7, 14, 21, 28, 35, 42, 49, 56]  # TODO: confirm production capture sizes
+    eager_fallback_when_unmatched: true
+  speculative:
+    method: mtp
+    num_speculative_tokens: 6
+  max_num_seqs: 8  # TODO: confirm; boot with a pool, vary concurrency by sending fewer requests
+  max_num_batched_tokens: null  # TODO
+  gpu_memory_utilization: null  # TODO
+hardware:
+  gpu_model: Intel Arc Pro B60
+  gpu_count: 2
+  tensor_parallel: 2
+  host_ram_gib: 25
+  mem_available_floor_gib: 2
+access:
+  mode: local  # TODO: "ssh" if the runner is driven from another machine; do not put IPs here
+safety:
+  hold_name: xpu-llm-bench-dense-baseline
+  hold_minutes: 180
+  hold_reason: xpu-llm-bench prod dense baseline
+  never_use_xpu_smi: true
+  allowed_containers: [vllm-bench-dense-baseline]
+prompts:
+  types: [code_edits, long_form, multi_turn_chat]
+  seed: 20261111
+  style: mixed
+ladder:
+  context_rungs_tokens: [8192, 32768, 65536, 131072]  # add 262144 when a full 260K rung is wanted
+  concurrency_steps: [1, 2, 4, 8]
+  load_modes: [closed_all_decoding, staggered, open_loop]
+  output_tokens_per_rung: 128
+  warmup: {tokens: 16, requests: 1}
+  grow_monotonically: true
+  boot_once: true
+  resume: true
+notes:
+  - Never restart vLLM to change concurrency.
+  - Never touch the production stack or protected services (see bench-site.example.yaml).

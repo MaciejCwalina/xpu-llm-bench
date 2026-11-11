@@ -1,0 +1,67 @@
+# Template for one-fix-at-a-time A/B ladders. Duplicate a variant pair per fix.
+# Each variant boots once. Do not restart vLLM to change concurrency.
+name: one-fix-at-a-time
+description: >
+  Template. Fill in image/commit and the exact env or launch-arg delta for one
+  speed fix, run, then `bench compare` the two results JSONL files. Repeat
+  per fix; never combine fixes in this template.
+profile: custom
+kind: template
+endpoint:
+  base_url: http://127.0.0.1:8000/v1  # TODO
+  metrics_url: http://127.0.0.1:8000/metrics
+  api_key_env: OPENAI_API_KEY
+  model: TODO-served-model-name
+server:
+  image: TODO-parent-image
+  image_digest: TODO-image-digest
+  container_name: vllm-bench-one-fix
+  source_commit: TODO-parent-commit
+  manage_container: false
+  attention_requested: qsa
+  kv_format: int8_k_int4_v
+  env:
+    K8V4_QSA: "1"
+  graph:
+    mode: FULL_DECODE_ONLY
+    per_gpu: false
+    capture_sizes: [7, 14, 21, 28, 35, 42, 49, 56]
+  speculative:
+    method: mtp
+    num_speculative_tokens: 6
+  max_num_seqs: 8
+hardware:
+  gpu_count: 2
+  tensor_parallel: 2
+  host_ram_gib: 25
+  mem_available_floor_gib: 2
+access:
+  mode: local  # TODO
+safety:
+  hold_name: xpu-llm-bench-one-fix
+  hold_minutes: 180
+  allowed_containers: [vllm-bench-one-fix-before, vllm-bench-one-fix-after]
+prompts:
+  types: [code_edits, long_form, multi_turn_chat]
+  seed: 20261111
+ladder:
+  context_rungs_tokens: [8192, 32768, 131072]
+  concurrency_steps: [1, 2, 4, 8]
+  load_modes: [closed_all_decoding]
+  output_tokens_per_rung: 128
+  warmup: {tokens: 16, requests: 1}
+  grow_monotonically: true
+  boot_once: true
+variants:
+  - name: before
+    container_name: vllm-bench-one-fix-before
+    notes: "TODO: parent commit / fix disabled"
+  - name: after
+    container_name: vllm-bench-one-fix-after
+    notes: "TODO: name the single fix (e.g. per-GPU graph capture, batched indexer scans, seq_lens on device, prefill debug print off, MTP-6 crash fix, DFlash2 packed window, pooled-int8)"
+    env:
+      # TODO: only the flags that enable this one fix
+      K8V4_QSA: "1"
+notes:
+  - One change per A/B. If the after image also contains unrelated commits, the rows are not a clean one-fix comparison.
+  - Use the same prompt seed and types on both sides.

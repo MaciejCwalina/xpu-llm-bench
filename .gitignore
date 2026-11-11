@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.log
+.env
+.env.*
+!.env.example
+results/**
+!results/.gitkeep
+!results/README.md
+
+# Site config with real host details (see bench-site.example.yaml)
+bench-site.local.yaml

@@ -1,0 +1,58 @@
+# Prioritized DFlash2 run: k=7, graph capture sizes in multiples of 8 (8..64).
+name: dflash2-k7
+description: DFlash2 packed-window drafter with capture sizes 8,16,...,64.
+profile: full
+kind: run
+endpoint:
+  base_url: http://127.0.0.1:8000/v1  # TODO
+  metrics_url: http://127.0.0.1:8000/metrics
+  api_key_env: OPENAI_API_KEY
+  model: TODO-served-model-name
+server:
+  image: <vllm-xpu-image>:<tag>  # placeholder; TODO: DFlash2-capable image
+  image_digest: TODO-image-digest
+  container_name: vllm-bench-dflash2-k7
+  source_commit: TODO-server-source-commit
+  manage_container: false
+  attention_requested: qsa
+  kv_format: int8_k_int4_v
+  env:
+    K8V4_QSA: "1"
+    # TODO: DFlash2 enable flags
+  launch_args: []  # TODO: speculative-config for dflash2
+  graph:
+    mode: FULL_DECODE_ONLY
+    per_gpu: true
+    # Multiples of 8, 8 through 64 inclusive. Do not use the MTP-6 7,14,...,56 set here.
+    capture_sizes: [8, 16, 24, 32, 40, 48, 56, 64]
+    eager_fallback_when_unmatched: true
+  speculative:
+    method: dflash2
+    num_speculative_tokens: 7
+    dflash_k: 7
+  max_num_seqs: 8
+hardware:
+  gpu_count: 2
+  tensor_parallel: 2
+  host_ram_gib: 25
+  mem_available_floor_gib: 2
+access:
+  mode: local  # TODO
+safety:
+  hold_name: xpu-llm-bench-dflash2-k7
+  hold_minutes: 180
+  allowed_containers: [vllm-bench-dflash2-k7]
+prompts:
+  types: [code_edits, long_form, multi_turn_chat]
+  seed: 20261111
+ladder:
+  context_rungs_tokens: [8192, 32768, 65536, 131072]
+  concurrency_steps: [1, 2, 4, 8]
+  load_modes: [closed_all_decoding, staggered, open_loop]
+  output_tokens_per_rung: 128
+  warmup: {tokens: 16, requests: 1}
+  grow_monotonically: true
+  boot_once: true
+notes:
+  - Capture sizes must stay multiples of 8 for this drafter. A mismatch should be flagged as eager fallback.
+  - "Same MTP accounting applies: accepted drafts exclude the bonus token; hit rate is accepted/proposed drafts."

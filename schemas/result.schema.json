@@ -1,0 +1,1415 @@
+{
+  "$defs": {
+    "AttentionSnapshot": {
+      "properties": {
+        "actual": {
+          "default": "unknown",
+          "enum": [
+            "qsa",
+            "dense",
+            "fallback",
+            "mixed",
+            "unknown"
+          ],
+          "title": "Actual",
+          "type": "string"
+        },
+        "evidence_lines": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Lines",
+          "type": "array"
+        },
+        "requested": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Requested"
+        }
+      },
+      "title": "AttentionSnapshot",
+      "type": "object"
+    },
+    "DecodeMethod": {
+      "properties": {
+        "counters": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Counters",
+          "type": "array"
+        },
+        "formula": {
+          "default": "Per session: window = first token -> last token of a fixed max_tokens output (ignore_eos). delivered E_i = tokens after the first (the first is the prefill step); verify steps S_i = token-bearing SSE chunks after the first (one chunk per engine step). decode tok/s = E_i / window; steps/s = S_i / window. true hit rate = (E - S) / (k * S) with E, S summed over sessions; S_server = delta(spec_decode_num_drafts_total) cross-checks S (STEP_COUNT_MISMATCH > 5%). accepted_drafts_per_step = E/S - 1 (from the stream); acceptance_rate_vllm = A/T is kept for continuity only.",
+          "title": "Formula",
+          "type": "string"
+        },
+        "method_id": {
+          "default": "fixed-tokens-chunks-v2",
+          "title": "Method Id",
+          "type": "string"
+        },
+        "output_tokens": {
+          "title": "Output Tokens",
+          "type": "integer"
+        },
+        "window": {
+          "default": "fixed_output_tokens",
+          "title": "Window",
+          "type": "string"
+        }
+      },
+      "required": [
+        "output_tokens"
+      ],
+      "title": "DecodeMethod",
+      "type": "object"
+    },
+    "GraphSnapshot": {
+      "properties": {
+        "capture_sizes": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Capture Sizes",
+          "type": "array"
+        },
+        "eager_fallback": {
+          "default": false,
+          "title": "Eager Fallback",
+          "type": "boolean"
+        },
+        "graphs_on": {
+          "default": true,
+          "title": "Graphs On",
+          "type": "boolean"
+        },
+        "mode": {
+          "title": "Mode",
+          "type": "string"
+        },
+        "per_gpu": {
+          "default": false,
+          "title": "Per Gpu",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "title": "GraphSnapshot",
+      "type": "object"
+    },
+    "HardwareSnapshot": {
+      "properties": {
+        "driver": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Driver"
+        },
+        "gpu_count": {
+          "default": 2,
+          "title": "Gpu Count",
+          "type": "integer"
+        },
+        "gpu_model": {
+          "default": "Intel Arc Pro B60",
+          "title": "Gpu Model",
+          "type": "string"
+        },
+        "host": {
+          "default": "<bench-host>",
+          "title": "Host",
+          "type": "string"
+        },
+        "host_ram_gib": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Host Ram Gib"
+        },
+        "mem_available_floor_gib": {
+          "default": 2.0,
+          "title": "Mem Available Floor Gib",
+          "type": "number"
+        },
+        "oneapi": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Oneapi"
+        },
+        "tensor_parallel": {
+          "default": 2,
+          "title": "Tensor Parallel",
+          "type": "integer"
+        }
+      },
+      "title": "HardwareSnapshot",
+      "type": "object"
+    },
+    "QualityResult": {
+      "properties": {
+        "code_edit_detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Code Edit Detail"
+        },
+        "code_edit_pass": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Code Edit Pass"
+        },
+        "format_ok": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Format Ok"
+        },
+        "format_problems": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Format Problems",
+          "type": "array"
+        },
+        "greedy_first_divergence": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Greedy First Divergence"
+        },
+        "greedy_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Greedy Ref"
+        },
+        "logprob_ok": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Logprob Ok"
+        },
+        "logprob_scores": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Logprob Scores",
+          "type": "object"
+        },
+        "logprob_worst_delta": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Logprob Worst Delta"
+        },
+        "needle_detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Needle Detail"
+        },
+        "needle_pass": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Needle Pass"
+        },
+        "repetition_max": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Repetition Max"
+        }
+      },
+      "title": "QualityResult",
+      "type": "object"
+    },
+    "RunManifest": {
+      "properties": {
+        "abort_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Abort Reason"
+        },
+        "attention": {
+          "$ref": "#/$defs/AttentionSnapshot"
+        },
+        "boot": {
+          "additionalProperties": true,
+          "title": "Boot",
+          "type": "object"
+        },
+        "completed_rung_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Completed Rung Ids",
+          "type": "array"
+        },
+        "config": {
+          "additionalProperties": true,
+          "title": "Config",
+          "type": "object"
+        },
+        "corpus_files": {
+          "additionalProperties": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "title": "Corpus Files",
+          "type": "object"
+        },
+        "decode_method": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DecodeMethod"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "fingerprint": {
+          "additionalProperties": true,
+          "title": "Fingerprint",
+          "type": "object"
+        },
+        "finished_et": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Finished Et"
+        },
+        "finished_utc": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Finished Utc"
+        },
+        "first_greedy_divergence": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "First Greedy Divergence"
+        },
+        "graph": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GraphSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "hardware": {
+          "$ref": "#/$defs/HardwareSnapshot"
+        },
+        "hold": {
+          "additionalProperties": true,
+          "title": "Hold",
+          "type": "object"
+        },
+        "host": {
+          "additionalProperties": true,
+          "title": "Host",
+          "type": "object"
+        },
+        "image": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Image"
+        },
+        "image_digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Image Digest"
+        },
+        "k": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "K"
+        },
+        "kv_format": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kv Format"
+        },
+        "notes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Notes",
+          "type": "array"
+        },
+        "output_jsonl": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Jsonl"
+        },
+        "profile": {
+          "title": "Profile",
+          "type": "string"
+        },
+        "prompt_seed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Seed"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "server_source_commit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Server Source Commit"
+        },
+        "spec_name": {
+          "title": "Spec Name",
+          "type": "string"
+        },
+        "spec_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Spec Path"
+        },
+        "speculative": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SpecDecodeSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "started_et": {
+          "title": "Started Et",
+          "type": "string"
+        },
+        "started_utc": {
+          "title": "Started Utc",
+          "type": "string"
+        },
+        "status": {
+          "default": "in_progress",
+          "enum": [
+            "in_progress",
+            "completed",
+            "aborted"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "tool_version": {
+          "default": "0.1.0",
+          "title": "Tool Version",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "spec_name",
+        "profile",
+        "started_utc",
+        "started_et",
+        "hardware"
+      ],
+      "title": "RunManifest",
+      "type": "object"
+    },
+    "RungResult": {
+      "properties": {
+        "acceptance_rate_vllm": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Acceptance Rate Vllm"
+        },
+        "accepted_drafts": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Accepted Drafts"
+        },
+        "accepted_drafts_per_step": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Accepted Drafts Per Step"
+        },
+        "attention_boot": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attention Boot"
+        },
+        "attention_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Attention Evidence",
+          "type": "array"
+        },
+        "attention_path": {
+          "default": "unknown",
+          "enum": [
+            "qsa",
+            "dense",
+            "fallback",
+            "mixed",
+            "unknown"
+          ],
+          "title": "Attention Path",
+          "type": "string"
+        },
+        "boot_started_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Boot Started At"
+        },
+        "build_fingerprint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Build Fingerprint"
+        },
+        "capture_sizes": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Capture Sizes",
+          "type": "array"
+        },
+        "ctx_per_user": {
+          "title": "Ctx Per User",
+          "type": "integer"
+        },
+        "ctx_tokens": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Ctx Tokens",
+          "type": "array"
+        },
+        "decode_batch_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Decode Batch Tokens"
+        },
+        "decode_tok_s_per_user": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Decode Tok S Per User"
+        },
+        "decode_tok_s_total": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Decode Tok S Total"
+        },
+        "decode_window_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Decode Window S"
+        },
+        "draft_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Draft Tokens"
+        },
+        "drafts": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Drafts"
+        },
+        "e2e_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "E2E Ms"
+        },
+        "eager_fallback": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Eager Fallback"
+        },
+        "errors": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Errors",
+          "type": "array"
+        },
+        "exit_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exit Reason"
+        },
+        "finished_et": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Finished Et"
+        },
+        "finished_utc": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Finished Utc"
+        },
+        "flags": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Flags",
+          "type": "array"
+        },
+        "gpu_mem": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Gpu Mem"
+        },
+        "graphs_on": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Graphs On"
+        },
+        "hit_rate": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hit Rate"
+        },
+        "image_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Image Id"
+        },
+        "itl_p50_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Itl P50 Ms"
+        },
+        "itl_p95_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Itl P95 Ms"
+        },
+        "itl_p99_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Itl P99 Ms"
+        },
+        "k": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "K"
+        },
+        "kv_cache_usage_max_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kv Cache Usage Max Pct"
+        },
+        "kv_cache_usage_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kv Cache Usage Pct"
+        },
+        "kv_format": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kv Format"
+        },
+        "launch_fingerprint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Launch Fingerprint"
+        },
+        "load_mode": {
+          "title": "Load Mode",
+          "type": "string"
+        },
+        "mem_available_min_gib": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mem Available Min Gib"
+        },
+        "other_vllm_stacks": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Other Vllm Stacks",
+          "type": "array"
+        },
+        "phase": {
+          "default": "meas",
+          "title": "Phase",
+          "type": "string"
+        },
+        "preemptions": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Preemptions"
+        },
+        "prefill_tok_s": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prefill Tok S"
+        },
+        "prefill_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prefill Tokens"
+        },
+        "prefix_cache_hit_rate": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prefix Cache Hit Rate"
+        },
+        "prompt_seed": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prompt Seed"
+        },
+        "prompt_type": {
+          "title": "Prompt Type",
+          "type": "string"
+        },
+        "quality": {
+          "$ref": "#/$defs/QualityResult"
+        },
+        "queue_time_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Queue Time Ms"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "rss_kib": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Rss Kib",
+          "type": "object"
+        },
+        "run_id": {
+          "title": "Run Id",
+          "type": "string"
+        },
+        "rung_id": {
+          "title": "Rung Id",
+          "type": "string"
+        },
+        "running_max": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Running Max"
+        },
+        "running_reqs": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Running Reqs"
+        },
+        "session_seeds": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Session Seeds",
+          "type": "array"
+        },
+        "started_et": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Started Et"
+        },
+        "started_utc": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Started Utc"
+        },
+        "steps_s_per_user": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Steps S Per User"
+        },
+        "steps_s_total": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Steps S Total"
+        },
+        "temperature": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Temperature"
+        },
+        "timeouts": {
+          "default": 0,
+          "title": "Timeouts",
+          "type": "integer"
+        },
+        "tokens_delivered": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tokens Delivered"
+        },
+        "tokens_per_step": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tokens Per Step"
+        },
+        "tpot_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tpot Ms"
+        },
+        "ttft_ms": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ttft Ms"
+        },
+        "users": {
+          "title": "Users",
+          "type": "integer"
+        },
+        "valid": {
+          "default": "valid",
+          "enum": [
+            "valid",
+            "invalid",
+            "warning"
+          ],
+          "title": "Valid",
+          "type": "string"
+        },
+        "verify_steps": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Verify Steps"
+        },
+        "verify_steps_server": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Verify Steps Server"
+        },
+        "verify_steps_stream": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Verify Steps Stream"
+        },
+        "waiting_max": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Waiting Max"
+        },
+        "waiting_reqs": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Waiting Reqs"
+        }
+      },
+      "required": [
+        "run_id",
+        "rung_id",
+        "users",
+        "ctx_tokens",
+        "ctx_per_user",
+        "prompt_type",
+        "load_mode"
+      ],
+      "title": "RungResult",
+      "type": "object"
+    },
+    "SpecDecodeSnapshot": {
+      "properties": {
+        "dflash_k": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Dflash K"
+        },
+        "method": {
+          "title": "Method",
+          "type": "string"
+        },
+        "num_speculative_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Num Speculative Tokens"
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "title": "SpecDecodeSnapshot",
+      "type": "object"
+    }
+  },
+  "$id": "urn:xpu-llm-bench:schemas:result",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/RungResult"
+    },
+    {
+      "$ref": "#/$defs/RunManifest"
+    }
+  ],
+  "title": "xpu-llm-bench results (generated from xpu_llm_bench.results; do not hand-edit)"
+}

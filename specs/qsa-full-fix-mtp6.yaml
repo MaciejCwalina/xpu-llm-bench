@@ -1,0 +1,61 @@
+# QSA path with the current full set of speed fixes, MTP-6.
+name: qsa-full-fix-mtp6
+description: QSA (requested) + MTP-6 on the full-fix image. Path is classified from logs, not assumed.
+profile: full
+kind: run
+endpoint:
+  base_url: http://127.0.0.1:8000/v1  # TODO: confirm test-container port
+  metrics_url: http://127.0.0.1:8000/metrics
+  api_key_env: OPENAI_API_KEY
+  model: TODO-served-model-name
+server:
+  image: <vllm-xpu-image>:<tag>  # placeholder; TODO: pin the full-fix image / digest
+  image_digest: TODO-image-digest
+  container_name: vllm-bench-qsa-mtp6
+  source_commit: TODO-server-source-commit
+  manage_container: false
+  attention_requested: qsa
+  kv_format: int8_k_int4_v  # TODO: confirm pooled-int8 indexer keys if enabled
+  env:
+    K8V4_QSA: "1"
+    QSA_SHARED: "TODO"
+    EXACT_TILED: "TODO"
+    V2_EXACT7: "TODO"
+    QSA_GRAPH: "TODO"
+  launch_args: []  # TODO
+  graph:
+    mode: FULL_DECODE_ONLY
+    per_gpu: true  # one of the seven speed fixes; TODO confirm default on this image
+    capture_sizes: [7, 14, 21, 28, 35, 42, 49, 56]  # MTP-6 verify window is 7 tokens
+    eager_fallback_when_unmatched: true
+  speculative:
+    method: mtp
+    num_speculative_tokens: 6
+  max_num_seqs: 8
+hardware:
+  gpu_model: Intel Arc Pro B60
+  gpu_count: 2
+  tensor_parallel: 2
+  host_ram_gib: 25
+  mem_available_floor_gib: 2
+access:
+  mode: local  # TODO
+safety:
+  hold_name: xpu-llm-bench-qsa-mtp6
+  hold_minutes: 180
+  hold_reason: xpu-llm-bench QSA full-fix MTP-6
+  allowed_containers: [vllm-bench-qsa-mtp6]
+prompts:
+  types: [code_edits, long_form, multi_turn_chat]
+  seed: 20261111
+ladder:
+  context_rungs_tokens: [8192, 32768, 65536, 131072]
+  concurrency_steps: [1, 2, 4, 8]
+  load_modes: [closed_all_decoding, staggered, open_loop]
+  output_tokens_per_rung: 128
+  warmup: {tokens: 16, requests: 1}
+  grow_monotonically: true
+  boot_once: true
+notes:
+  - Classify the attention path from docker logs (QSA_GRAPH width= / QSA_GRAPH skip). Do not assume QSA ran.
+  - Batches with n>28 have no QSA graph path and run dense; record that as fallback/mixed when it happens.

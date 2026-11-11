@@ -1,0 +1,28 @@
+# Greedy reference boot: same image/patches as the run under test, speculative
+# decoding OFF. Its greedy_outputs.jsonl is the reference for
+# quality.greedy_reference (MTP on vs off: where do greedy outputs first diverge).
+# Run it with the same profile and seed as the runs it will be compared with.
+name: mtp-off-reference
+description: Speculative decoding off; captures greedy reference outputs.
+profile: quick
+kind: run
+endpoint:
+  base_url: http://127.0.0.1:8102/v1  # TODO (never a protected production port)
+  metrics_url: http://127.0.0.1:8102/metrics
+  health_url: http://127.0.0.1:8102/health
+  model: TODO-served-model-name
+server:
+  container_name: vllm-bench-mtp-off
+  attention_requested: qsa
+  kv_format: int8_k_int4_v
+  graph:
+    mode: FULL_DECODE_ONLY
+    capture_sizes: [1, 2, 4, 8]
+  speculative:
+    method: none
+hardware:
+  mem_available_floor_gib: 2
+safety:
+  hold_name: xpu-llm-bench-mtp-off
+prompts:
+  seed: 20261111

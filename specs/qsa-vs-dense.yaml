@@ -1,0 +1,67 @@
+# Prioritized A/B: QSA against dense, same prompt corpus, same ladder, one boot per variant.
+# Historical comparison points: 1u 8K, 1u 131K, 2u 8K, 4u 8K. The progressive
+# schedule also covers 8 users and the other rungs without tearing context down.
+name: qsa-vs-dense
+description: K8V4_QSA=1 vs 0, identical prompts and ladder. Compare with `bench compare`.
+profile: custom
+kind: comparison
+endpoint:
+  base_url: http://127.0.0.1:8000/v1  # TODO
+  metrics_url: http://127.0.0.1:8000/metrics
+  api_key_env: OPENAI_API_KEY
+  model: TODO-served-model-name
+server:
+  image: <vllm-xpu-image>:<tag>  # placeholder; TODO: same image for both sides
+  image_digest: TODO-image-digest
+  container_name: vllm-bench-qsa-vs-dense
+  source_commit: TODO-server-source-commit
+  manage_container: false
+  attention_requested: auto
+  kv_format: int8_k_int4_v
+  env: {}
+  launch_args: []  # TODO: must be identical across variants except the QSA flag
+  graph:
+    mode: FULL_DECODE_ONLY
+    per_gpu: true
+    capture_sizes: [7, 14, 21, 28, 35, 42, 49, 56]
+  speculative:
+    method: mtp
+    num_speculative_tokens: 6
+  max_num_seqs: 8
+hardware:
+  gpu_count: 2
+  tensor_parallel: 2
+  host_ram_gib: 25
+  mem_available_floor_gib: 2
+access:
+  mode: local  # TODO
+safety:
+  hold_name: xpu-llm-bench-qsa-vs-dense
+  hold_minutes: 180
+  allowed_containers: [vllm-bench-qsa-vs-dense-qsa, vllm-bench-qsa-vs-dense-dense]
+prompts:
+  types: [code_edits, long_form, multi_turn_chat]
+  seed: 20261111
+ladder:
+  # Progressive schedule still grows 8K then 131K (and optionally mid rungs).
+  # 32K/64K omitted here to keep this A/B closer to the four historical cells;
+  # use qsa-full-fix-mtp6 + prod-dense-baseline for the complete matrix.
+  context_rungs_tokens: [8192, 131072]
+  concurrency_steps: [1, 2, 4, 8]
+  load_modes: [closed_all_decoding]
+  output_tokens_per_rung: 128
+  warmup: {tokens: 16, requests: 1}
+  grow_monotonically: true
+  boot_once: true
+variants:
+  - name: qsa
+    env: {K8V4_QSA: "1"}
+    attention_requested: qsa
+    container_name: vllm-bench-qsa-vs-dense-qsa
+  - name: dense
+    env: {K8V4_QSA: "0"}
+    attention_requested: dense
+    container_name: vllm-bench-qsa-vs-dense-dense
+notes:
+  - Same seed, same prompt types, same output window. Mismatched prompt types are non-comparable.
+  - "Report path evidence: a QSA requested row that only shows QSA_GRAPH skip is a fallback, not a QSA win."

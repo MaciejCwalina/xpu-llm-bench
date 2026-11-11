@@ -1,0 +1,27 @@
+# Example site config. Copy to bench-site.local.yaml (gitignored), or to
+# ~/.config/xpu-llm-bench/site.yaml, or point $XPU_BENCH_SITE at it, and fill
+# in the real values for your bench host. Never commit the real file.
+#
+# Everything here only ADDS protection to the built-in neutral defaults
+# (container "vllm-production", port 8001, CI-runner name patterns).
+
+# Display name of the bench host (written to results as hardware.host).
+host: <bench-host>
+# ssh target when a spec uses access.mode: ssh (an ~/.ssh/config alias is best).
+ssh_host: <bench-host>
+
+# Exact names of production containers the runner must never touch.
+protected_containers:
+  - <production-vllm-container>
+# Case-insensitive regexes for other protected services (gateways, git hosting, ...).
+protected_patterns:
+  - <protected-service-pattern>
+# Host ports of production endpoints. Endpoints and test containers bound to
+# these ports are refused.
+forbidden_ports:
+  - 8001
+
+# Path of the bench-hold CLI on the bench host.
+hold_command: bench-hold
+# Optional operator quiet-hold file (read only; an active quiet hold blocks runs).
+quiet_hold_file: null
