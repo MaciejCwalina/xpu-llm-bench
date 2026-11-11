@@ -73,7 +73,9 @@ def test_progressive_ladder_rows_and_metrics(mock_server, tmp_path: Path) -> Non
         "multi_turn_chat:closed:1u:256:S",
         "multi_turn_chat:closed:1u:512:S",
         "multi_turn_chat:closed:2u:256:C",
+        "multi_turn_chat:closed:2u:512:C",
         "multi_turn_chat:closed:4u:256:C",
+        "multi_turn_chat:closed:4u:512:C",
     ]
     for r in rows:
         # Mock streams 1 prefill token then 4-token verify steps (1 bonus + 3 accepted).
@@ -87,9 +89,10 @@ def test_progressive_ladder_rows_and_metrics(mock_server, tmp_path: Path) -> Non
         assert r.mem_available_min_gib == pytest.approx(8.0)
         assert "SPEC_COUNTER_BROKEN" not in r.flags and "CONCURRENT_CLIENT" not in r.flags
         assert r.decode_batch_tokens == r.users * 7
-    # session 1 never shrinks, joiners at 256
-    assert rows[0].ctx_tokens[0] <= rows[1].ctx_tokens[0] <= rows[3].ctx_tokens[0]
-    assert len(rows[3].ctx_tokens) == 4
+    # session 1 grows; each user count climbs 256 -> 512 with all its users at the same context
+    assert rows[0].ctx_tokens[0] <= rows[1].ctx_tokens[0]
+    assert len(rows[4].ctx_tokens) == 4 and len(rows[5].ctx_tokens) == 4
+    assert min(rows[5].ctx_tokens) > max(rows[4].ctx_tokens)
     # report: steps/s sits next to tok/s
     md = run_report(rows, RunManifest.load(tmp_path / "o" / "manifest.json"))
     header = next(ln for ln in md.splitlines() if ln.startswith("| rung_id"))

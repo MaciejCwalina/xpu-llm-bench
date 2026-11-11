@@ -32,6 +32,18 @@ FLAGS: dict[str, str] = {
     "FOREIGN_STACK": "Another vLLM stack (different container) is resident on the host.",
     "PROTECTED_PORT": "Server bound to a protected production port (only possible on imported rows).",
     "RAM_FLOOR": "MemAvailable hit the floor; runner guard aborted.",
+    "PRE_EXISTING_LOAD": (
+        "The server was already busy or the GPU already loaded when the run started (see manifest "
+        "pre_run_load); numbers include that load."
+    ),
+    "CTX_FILL_OFF": (
+        "Filled context is more than 2% away from the rung target (see ctx_tokens / ctx_fill_pct); "
+        "the server tokenizer (/tokenize) was not available to top up the prompt."
+    ),
+    "CTX_CEILING": (
+        "This user count's context ceiling: the rung did not fit (KV capacity, the server rejected "
+        "the context, RAM floor or OOM). The user count stops here; the run continues with the next one."
+    ),
     "OOM": "Out-of-memory (container OOMKilled or OOM lines in logs).",
     "SPEC_ASSERT": "Known assert: Expected spec_token == num_spec_decodes * (num_speculative_tokens + 1).",
     "ENGINE_ERROR": "Engine error / traceback in logs or HTTP 5xx.",
@@ -154,6 +166,8 @@ class RungResult(BaseModel):
     users: int
     ctx_tokens: list[int]  # per live session, in session order
     ctx_per_user: int  # representative / target context for this rung
+    # Mean of ctx_tokens (server-reported prompt tokens) as % of ctx_per_user.
+    ctx_fill_pct: float | None = None
     prompt_type: str
     load_mode: str
     phase: str = "meas"  # S (session 1 grows) | C (sessions join) | meas (grid)
@@ -296,6 +310,20 @@ class RunManifest(BaseModel):
     # Server start command and settings captured read-only at preflight
     # (docker inspect / ps / vLLM boot log), secrets redacted. Also in launch.json.
     launch: dict[str, Any] = Field(default_factory=dict)
+    # Context ladder actually used (``auto`` resolved against the server).
+    max_model_len: int | None = None
+    max_model_len_source: str | None = None  # "/v1/models", "boot_log" or None
+    context_rungs: list[int] = Field(default_factory=list)
+    context_note: str | None = None
+    # Server KV cache capacity in tokens and where it came from.
+    kv_capacity_tokens: int | None = None
+    kv_capacity_source: str | None = None
+    # Per "family|load_mode|users": {"users", "max_ok_ctx", "stopped_at", "reason", "detail", "rung_id"}.
+    ctx_ceilings: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    # Highest context each "family|load_mode|users" line measured successfully.
+    ctx_reached: dict[str, int] = Field(default_factory=dict)
+    # Server / GPU load seen just before the first rung (two /metrics scrapes).
+    pre_run_load: dict[str, Any] = Field(default_factory=dict)
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(

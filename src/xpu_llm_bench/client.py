@@ -211,6 +211,27 @@ class OpenAICompatClient:
         toks = data.get("tokens")
         return [int(t) for t in toks] if isinstance(toks, list) else None
 
+    def count_chat_tokens(self, messages: list[dict[str, str]], url: str | None = None) -> int | None:
+        """Prompt tokens of a chat request, from vLLM /tokenize with ``messages``
+        (chat template and generation prompt applied). None if unavailable."""
+        target = url or default_origin(self.base_url.rstrip("/")) + "/tokenize"
+        status, body = self.request_json(
+            "POST",
+            target,
+            {"model": self.model, "messages": messages, "add_generation_prompt": True},
+            timeout=120.0,
+        )
+        if status != 200:
+            return None
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(data.get("count"), int):
+            return int(data["count"])
+        toks = data.get("tokens")
+        return len(toks) if isinstance(toks, list) else None
+
     def prompt_logprobs(self, prompt_ids: list[int], timeout: float | None = None) -> list[float | None] | None:
         """Per-position logprob of each prompt token (None for position 0).
 

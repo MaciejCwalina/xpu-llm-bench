@@ -46,6 +46,9 @@ class MetricsState:
         # Test controls (unused by the original scaffold tests).
         self.chat_requests = 0
         self.fail_from: int | None = None  # 0-based chat request index that starts failing
+        self.max_model_len: int | None = None  # reported by /v1/models when set
+        self.reject_above: int | None = None  # 400 "maximum context length" above this many prompt tokens
+        self.cache_blocks: tuple[int, int] | None = None  # (num_gpu_blocks, block_size) for cache_config_info
 
     def bump(self, output_tokens: int, prompt_tokens: int, chunks: list[int] | None = None) -> None:
         """Account one request. ``chunks`` = tokens per streamed step; the first
@@ -86,7 +89,13 @@ class MetricsState:
                     f"vllm:num_preemptions_total{{{model}}} {self.preemptions}",
                     f'vllm:prefix_cache_hits_total{{{model}}} {self.prefix_hits}',
                     f'vllm:prefix_cache_queries_total{{{model}}} {self.prefix_queries}',
-                    f"vllm:gpu_cache_usage_perc {self.kv_usage}",
+                    # KV usage counts blocks held by running requests: 0 when idle.
+                    f"vllm:gpu_cache_usage_perc {self.kv_usage if self.running else 0.0}",
+                    *(
+                        [f'vllm:cache_config_info{{block_size="{self.cache_blocks[1]}",'
+                         f'num_gpu_blocks="{self.cache_blocks[0]}"}} 1.0']
+                        if self.cache_blocks else []
+                    ),
                     f"vllm:num_requests_running {self.running}",
                     f"vllm:num_requests_waiting {self.waiting}",
                     f"vllm:request_queue_time_seconds_sum {self.queue_sum}",
@@ -117,6 +126,17 @@ def make_handler(state: MetricsState, logs: list[str]):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if self.path.endswith("/v1/models"):
+                item = {"id": "m", "object": "model"}
+                if state.max_model_len:
+                    item["max_model_len"] = state.max_model_len
+                body = json.dumps({"object": "list", "data": [item]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path.startswith("/health"):
                 self.send_response(200)
                 self.end_headers()
@@ -133,8 +153,13 @@ def make_handler(state: MetricsState, logs: list[str]):
             except json.JSONDecodeError:
                 payload = {}
             if self.path.endswith("/tokenize"):
-                prompt = payload.get("prompt") or ""
-                body = json.dumps({"count": max(1, len(prompt) // 4)}).encode()
+                if payload.get("messages") is not None:
+                    # Same count the chat endpoint reports as prompt_tokens.
+                    chars = sum(len(m.get("content") or "") for m in payload["messages"])
+                    body = json.dumps({"count": max(1, chars // 4)}).encode()
+                else:
+                    prompt = payload.get("prompt") or ""
+                    body = json.dumps({"count": max(1, len(prompt) // 4)}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -159,6 +184,18 @@ def make_handler(state: MetricsState, logs: list[str]):
                 max_tokens = int(payload.get("max_tokens") or 8)
                 messages = payload.get("messages") or []
                 prompt_tokens = max(1, sum(len(m.get("content") or "") for m in messages) // 4)
+                if state.reject_above is not None and prompt_tokens > state.reject_above:
+                    msg = (
+                        f"This model's maximum context length is {state.reject_above} tokens. However, you "
+                        f"requested {prompt_tokens + max_tokens} tokens. Please reduce the length of the messages."
+                    )
+                    body = json.dumps({"object": "error", "message": msg, "code": 400}).encode()
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 # MTP-6 style stream: prefill chunk of 1 token, then verify
                 # steps of 4 tokens (1 bonus + 3 accepted drafts).
                 chunks: list[int] = [1]
@@ -205,3 +242,9 @@ def mock_server():
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.fixture(autouse=True)
+def _fast_load_probe(monkeypatch):
+    """The pre-run load check waits 2 s between /metrics scrapes; not in tests."""
+    monkeypatch.setattr("xpu_llm_bench.runner.DEFAULT_LOAD_PROBE_S", 0.0)

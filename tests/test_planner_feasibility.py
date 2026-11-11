@@ -13,8 +13,7 @@ from xpu_llm_bench.planner import (
     local_mem_available_gib,
     make_plan,
 )
-from xpu_llm_bench.results import RungResult, RunManifest
-from xpu_llm_bench.runner import RunRefused
+from xpu_llm_bench.results import RungResult
 from xpu_llm_bench.schedule import build_schedule
 from xpu_llm_bench.spec import RunSpec
 
@@ -24,7 +23,9 @@ SPECS = Path(__file__).resolve().parents[1] / "specs"
 def _s(**over) -> RunSpec:
     data = {"name": "f", "profile": "custom",
             "hardware": {"gpu_count": 2, "gpu_mem_gib": 24},
-            "ladder": {"context_rungs_tokens": [8192, 131072], "concurrency_steps": [1, 2, 4, 8]}}
+            # stop_at_ceiling false: the whole-run check (every rung must fit).
+            "ladder": {"context_rungs_tokens": [8192, 131072], "concurrency_steps": [1, 2, 4, 8],
+                       "stop_at_ceiling": False}}
     for k, v in over.items():
         data[k] = {**data.get(k, {}), **v} if isinstance(v, dict) else v
     return RunSpec.model_validate(data)
@@ -34,33 +35,33 @@ def _f(spec, mem=None):
     return feasibility(spec, build_schedule(spec), mem)
 
 
-def test_without_a_reading_host_is_unverified_never_ok() -> None:
+def test_without_a_reading_host_is_unverified_and_informational() -> None:
     f = _f(_s())
-    assert f.host_status == "unverified" and f.ok  # a warning, not a pass and not a failure
-    assert any(n.startswith("WARN host RAM: no MemAvailable reading") for n in f.notes)
-    assert "UNVERIFIED" in __import__("xpu_llm_bench.planner", fromlist=["format_plan"]).format_plan(make_plan(_s()))
+    assert f.host_status == "unverified" and f.failures == []
+    from xpu_llm_bench.planner import format_plan
+
+    out = format_plan(make_plan(_s()))
+    assert "Host RAM (info only, never blocks)" in out and "no MemAvailable reading" in out
 
 
-def test_live_mem_available_decides() -> None:
-    assert _f(_s(), mem=64.0).host_status == "ok"
+def test_host_ram_estimate_never_blocks() -> None:
+    assert _f(_s(), mem=128.0).host_status == "ok"
     f = _f(_s(), mem=6.0)
-    assert f.host_status == "fail" and not f.ok
-    assert any(n.startswith("FAIL host RAM") for n in f.notes)
+    assert f.host_status == "over" and f.failures == []
+    assert not any("host RAM" in n for n in f.notes)  # one Host RAM line in the plan, no duplicate note
+    out = __import__("xpu_llm_bench.planner", fromlist=["format_plan"]).format_plan(make_plan(_s(), mem_available_gib=6.0))
+    assert out.count("Host RAM") == 1 and "(OVER)" in out and "FAIL" not in out
 
 
-def test_qsa_4_users_at_8k_is_not_ok() -> None:
+def test_qsa_4_users_at_8k_estimate_is_informational() -> None:
     """Reality: QSA at 4 users / 8K joiners hit the 2 GiB MemAvailable floor,
-    starting from ~4.8 GiB available with the server booted."""
-    spec = _s(ladder={"context_rungs_tokens": [8192], "concurrency_steps": [1, 2, 4]})
-    assert _f(spec, mem=4.8).host_status in {"tight", "fail"}
-    quick = RunSpec.model_validate(
-        {**__import__("yaml").safe_load((SPECS / "qsa-vs-dense.yaml").read_text()), "profile": "quick"}
-    )
-    from xpu_llm_bench.spec import apply_profile, load_spec  # noqa: F401
+    starting from ~4.8 GiB available. The estimate shows it but never blocks:
+    the live RAM floor stops that user count (CTX_CEILING) instead."""
+    from xpu_llm_bench.spec import load_spec
 
     q = load_spec(SPECS / "qsa-vs-dense.yaml", profile="quick")
-    assert feasibility(q, build_schedule(q), 4.8).host_status == "fail"
-    assert quick.name == "qsa-vs-dense"
+    f = feasibility(q, build_schedule(q), 4.8)
+    assert f.host_status in {"over", "tight"} and f.failures == []
 
 
 def test_floor_and_per_token_rate_are_configurable(monkeypatch, tmp_path: Path) -> None:
@@ -86,15 +87,32 @@ def test_floor_and_per_token_rate_are_configurable(monkeypatch, tmp_path: Path) 
 
 def test_host_kv_share_counts() -> None:
     spec = _s(planner={"host_kv_fraction": 1.0, "host_bytes_per_token": 0, "assumed_kv_bytes_per_token": 200_000})
-    assert _f(spec, mem=20.0).host_status == "fail"
+    assert _f(spec, mem=20.0).host_status == "over"
 
 
 def test_gpu_can_fail_warn_or_be_unknown() -> None:
-    assert _f(_s(planner={"assumed_kv_bytes_per_token": 200_000})).gpu_status == "fail"
-    assert _f(_s(planner={"assumed_weight_gib": 36.0})).gpu_status == "tight"
+    f = _f(_s(planner={"assumed_kv_bytes_per_token": 200_000}))
+    assert f.gpu_status == "fail" and f.failures == []  # an estimate: warns, never blocks
+    assert any(n.startswith("WARN GPU (estimate, does not block)") for n in f.notes)
+    assert _f(_s(planner={"assumed_weight_gib": 36.0}, ladder={"context_rungs_tokens": [8192]})).gpu_status == "tight"
     unknown = RunSpec.model_validate({"name": "u", "profile": "custom"})
     f = _f(unknown)
     assert f.gpu_status == "unknown" and any("gpu_count / gpu_mem_gib not set" in n for n in f.notes)
+
+
+def test_ceiling_estimates_per_user_count() -> None:
+    from xpu_llm_bench.planner import format_plan
+
+    spec = _s(ladder={"context_rungs_tokens": "auto", "stop_at_ceiling": True})
+    plan = make_plan(spec, max_model_len=262144, kv_capacity_tokens=700_000)
+    by_users = {c.users: c for c in plan.feasibility.ceilings if c.load_mode == "closed_all_decoding"
+                and c.family == "code_edits"}
+    assert by_users[1].stops_at is None and by_users[2].stops_at is None
+    assert by_users[4].top_ok == 131072 and by_users[4].stops_at == 196608 and by_users[4].reason == "kv_capacity"
+    assert by_users[8].top_ok == 65536
+    out = format_plan(plan)
+    assert "Context ceiling per user count" in out and "4u: up to 131K, stops at 196K (kv_capacity)" in out
+    assert "Context rungs: 8K, 32K, 64K, 131K, 196K, 260K" in out
 
 
 def _row(mem: float | None) -> RungResult:
@@ -111,31 +129,44 @@ def test_baseline_from_rows_and_local_meminfo(tmp_path: Path) -> None:
     assert local_mem_available_gib(str(tmp_path / "nope")) is None
 
 
-def test_plan_cli_exit_codes(tmp_path: Path, capsys) -> None:
+def test_plan_cli_never_fails_on_estimates(tmp_path: Path, capsys) -> None:
     spec = tmp_path / "s.yaml"
     spec.write_text("name: s\nprofile: custom\naccess: {mode: ssh}\n"
                     "ladder: {context_rungs_tokens: [8192], concurrency_steps: [1, 2, 4]}\n")
     assert main(["plan", str(spec)]) == 0
-    assert "UNVERIFIED" in capsys.readouterr().out
-    assert main(["plan", str(spec), "--mem-available", "2.5"]) == 1
-    assert "FAIL host RAM" in capsys.readouterr().out
+    assert "no MemAvailable reading" in capsys.readouterr().out
+    assert main(["plan", str(spec), "--mem-available", "2.5"]) == 0
+    assert "(OVER)" in capsys.readouterr().out
     res = tmp_path / "results.jsonl"
     res.write_text(_row(2.2).model_dump_json() + "\n")
-    assert main(["plan", str(spec), "--measured", str(res)]) == 1
+    assert main(["plan", str(spec), "--measured", str(res)]) == 0
     assert "measured baseline" in capsys.readouterr().out
+    assert main(["plan", str(spec), "--max-model-len", "262144", "--kv-capacity-tokens", "100000"]) == 0
+    assert "Context ceiling per user count" in capsys.readouterr().out
 
 
-def test_live_preflight_uses_live_mem_available(mock_server, tmp_path: Path) -> None:
+def test_live_preflight_records_mem_but_estimate_never_refuses(mock_server, tmp_path: Path) -> None:
+    from xpu_llm_bench.ram import LocalMemInfo, RamFloorError
+
     spec = _spec(mock_server["base"])
     spec.hardware.mem_available_floor_gib = 2.0
+    spec.planner.host_bytes_per_token = 10 * 1024 ** 2  # estimate far over budget
     mem = tmp_path / "meminfo"
-    mem.write_text("MemAvailable: 2050000 kB\n")  # ~1.96 GiB: already under the 2 GiB floor
+    mem.write_text("MemAvailable: 3145728 kB\n")  # 3 GiB: 1 GiB above the floor
     r = _runner(spec, tmp_path / "o", mock_server, tmp_path)
-    from xpu_llm_bench.ram import LocalMemInfo
-
     r.ram_source = LocalMemInfo(str(mem))
-    with pytest.raises(RunRefused, match="FAIL host RAM"):
-        r.run()
-    assert mock_server["state"].chat_requests == 0
-    man = RunManifest.load(tmp_path / "o" / "manifest.json")
-    assert man.status == "refused" and man.launch_check["feasibility"]["mem_available_gib"] == pytest.approx(1.96, abs=0.01)
+    man = r.run()
+    assert man.status == "completed" and mock_server["state"].chat_requests > 0
+    assert man.launch_check["feasibility"]["host"] == "over"
+    assert man.launch_check["feasibility"]["mem_available_gib"] == pytest.approx(3.0, abs=0.01)
+    assert any(n.startswith("INFO host RAM estimate (never blocks)") for n in man.notes)
+
+    # A live reading already under the floor is not an estimate: the runtime
+    # floor guard still stops before the first rung.
+    mem.write_text("MemAvailable: 2050000 kB\n")
+    r2 = _runner(spec, tmp_path / "o2", mock_server, tmp_path)
+    r2.ram_source = LocalMemInfo(str(mem))
+    before = mock_server["state"].chat_requests
+    with pytest.raises(RamFloorError):
+        r2.run()
+    assert mock_server["state"].chat_requests == before

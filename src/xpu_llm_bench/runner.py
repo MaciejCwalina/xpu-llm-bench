@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import threading
 import time
@@ -85,11 +86,68 @@ from xpu_llm_bench.safety import (
     is_protected_container,
     site_forbidden_ports,
 )
-from xpu_llm_bench.schedule import Rung, build_schedule
+from xpu_llm_bench.schedule import Rung, build_schedule, ceiling_key
 from xpu_llm_bench.site import describe_site, load_site
-from xpu_llm_bench.spec import RunSpec, apply_variant, is_placeholder, spec_placeholders
+from xpu_llm_bench.spec import (
+    RunSpec,
+    apply_variant,
+    is_placeholder,
+    resolve_contexts,
+    spec_placeholders,
+    with_contexts,
+)
 
 ABORTING_EXITS = {"RAM_FLOOR", "OOM", "SPEC_ASSERT", "ENGINE_ERROR"}
+DEFAULT_LOAD_PROBE_S = 2.0  # pre-run load check: seconds between the two /metrics scrapes
+
+# A failed rung whose errors read like this hit the context ceiling of its
+# user count (the server refused the length or ran out of KV), not a crash.
+_CTX_REJECT_RE = re.compile(
+    r"maximum context length|max_model_len|context length|prompt is too long|too many tokens|"
+    r"longer than the maximum|exceeds the max",
+    re.I,
+)
+_KV_FULL_RE = re.compile(
+    r"KV cache|num_gpu_blocks|not enough (?:free )?blocks|insufficient (?:KV|cache)|larger than the available",
+    re.I,
+)
+
+
+def ctx_fill_pct(ctx_tokens: list[int], target: int) -> float | None:
+    """Mean filled prompt tokens as a percentage of the rung's target."""
+    vals = [c for c in ctx_tokens if c]
+    if not vals or not target:
+        return None
+    return round(100.0 * (sum(vals) / len(vals)) / target, 2)
+
+
+def ceiling_reason(row: RungResult) -> str | None:
+    """Why a failed rung is this user count's context ceiling (None: a real failure)."""
+    if row.valid != "invalid":
+        return None
+    if row.exit_reason == "RAM_FLOOR":
+        return "ram_floor"
+    if row.exit_reason == "OOM":
+        return "oom"
+    text = " ".join([row.reason or "", *(row.errors or [])])
+    if _KV_FULL_RE.search(text):
+        return "kv_capacity"
+    if _CTX_REJECT_RE.search(text):
+        return "server_rejected_context"
+    return None
+
+
+def kv_capacity_from_metrics(text: str) -> int | None:
+    """KV capacity in tokens from vllm:cache_config_info (num_gpu_blocks x block_size)."""
+    for line in text.splitlines():
+        if not line.startswith("vllm:cache_config_info{"):
+            continue
+        labels = dict(re.findall(r'(\w+)="([^"]*)"', line))
+        try:
+            return int(labels["num_gpu_blocks"]) * int(labels["block_size"])
+        except (KeyError, ValueError):
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +231,18 @@ class Session:
         needle_text = needle_for(self.seed, segment)[0] if self.plant_needles else None
         body = self.corpus.segment(n_chars, segment, needle=needle_text)
         return (self.corpus.opener() if opener else "") + body + self.corpus.ask()
+
+    def resize_last_user(self, n_chars: int) -> None:
+        """Re-cut the newest (not yet sent) user turn to ``n_chars`` of corpus
+        text. Deterministic, so --resume regenerates the same turn."""
+        if not self.messages or self.messages[-1]["role"] != "user" or not self.turns:
+            return
+        turn = self.turns[-1]
+        n_chars = max(int(n_chars), 64)
+        content = self._user_text(n_chars, int(turn["segment"]), bool(turn["opener"]))
+        self.messages[-1] = {"role": "user", "content": content}
+        turn["n_chars"] = n_chars
+        turn["sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
     def grow_message(self, target_tokens: int) -> list[dict[str, str]]:  # scaffold name
         return self.grow_to(target_tokens)
@@ -377,8 +447,17 @@ class Runner:
         require_container: bool = True,
         html: bool = True,
         ps_fn: Callable[[], str] | None = None,
+        assume_yes: bool = False,
+        confirm_fn: Callable[[str], bool] | None = None,
+        load_probe_s: float | None = None,
     ):
         self.spec = spec
+        # Pre-run load check: warn and ask once when the GPU or the server is
+        # already busy (--yes, or a non-interactive stdin, answers yes).
+        self.assume_yes = assume_yes
+        self._confirm_fn = confirm_fn
+        self.load_probe_s = DEFAULT_LOAD_PROBE_S if load_probe_s is None else load_probe_s
+        self._pre_load_flag = False
         # Dry runs never share a directory (or a manifest) with a real run.
         self.output_dir = Path(output_dir) / "dry-run" if dry_run else Path(output_dir)
         self.dry_run = dry_run
@@ -648,6 +727,35 @@ class Runner:
             messages, max_tokens=max_tokens, temperature=self.spec.ladder.temperature, extra=extra
         )
 
+    def _fit_to_target(self, sess: Session, target: int, tol: float = 0.01) -> int | None:
+        """Make the new user turn bring the prompt to ``target`` tokens
+        (within ``tol``), counted by the server's own tokenizer (/tokenize
+        with the chat messages) and topped up or trimmed before anything is
+        sent. Returns the counted prompt tokens (None: no tokenizer; the
+        chars-per-token estimate stands and the row records what the server
+        reported)."""
+        if getattr(self, "_tokenize_ok", True) is False:
+            return None
+        count = None
+        for _ in range(6):
+            try:
+                count = self.client.count_chat_tokens(sess.messages, url=self.spec.endpoint.tokenize_url)
+            except Exception:  # noqa: BLE001
+                count = None
+            if count is None:
+                self._tokenize_ok = False
+                return None
+            if abs(count - target) <= tol * target:
+                break
+            turn = sess.turns[-1]
+            body_chars = len(sess.messages[-1]["content"])
+            cpt = max(sess.chars() / max(count, 1), 0.5)
+            sess.resize_last_user(int(turn["n_chars"]) + int((target - count) * cpt))
+            if len(sess.messages[-1]["content"]) == body_chars:
+                break
+        sess.cpt = max(sess.chars() / max(count or 1, 1), 0.5)
+        return count
+
     def _grow(self, rung: Rung, sessions: dict[int, Session], watcher: RamWatcher, metrics_ok: bool) -> tuple[list, list[str]]:
         """Grow sessions one at a time (joiners join one at a time). Returns (prefill stats, errors)."""
         stats = []
@@ -655,7 +763,11 @@ class Runner:
         for sid in rung.grow_sessions:
             watcher.raise_if_tripped()
             sess = sessions[sid]
+            n_turns = len(sess.messages)
             messages = sess.grow_to(rung.target_for(sid))
+            if len(sess.messages) > n_turns:
+                self._fit_to_target(sess, rung.target_for(sid))
+                messages = sess.messages
             before = parse_prometheus(self._metrics_text()) if metrics_ok else {}
             res = self._stream(messages, max_tokens=max(self.spec.ladder.warmup.tokens, 1), measured=False)
             after = parse_prometheus(self._metrics_text()) if metrics_ok else {}
@@ -1023,7 +1135,11 @@ class Runner:
         utc1, et1 = stamp_pair()
         valid = "valid"
         reason = None
-        hard = {"NOT_AS_LABELED", "SPEC_COUNTER_BROKEN", "SPEC_ASSERT", "REBOOTED", "CONCURRENT_CLIENT", "QSA_FALLBACK", "MIXED_PATH"}
+        fill_pct = ctx_fill_pct(ctxs, rung.ctx_per_user)
+        if fill_pct is not None and abs(fill_pct - 100.0) > 2.0:
+            flags.append("CTX_FILL_OFF")
+        hard = {"NOT_AS_LABELED", "SPEC_COUNTER_BROKEN", "SPEC_ASSERT", "REBOOTED", "CONCURRENT_CLIENT", "QSA_FALLBACK",
+                "MIXED_PATH", "PRE_EXISTING_LOAD"}
         if set(flags) & hard:
             valid = "warning"
             reason = "flags: " + " ".join(sorted(set(flags) & hard))
@@ -1033,6 +1149,7 @@ class Runner:
         return RungResult(
             **base,
             ctx_tokens=ctxs,
+            ctx_fill_pct=fill_pct,
             capture_sizes=sizes,
             decode_batch_tokens=batch,
             prefill_tok_s=prefill_rate,
@@ -1145,7 +1262,9 @@ class Runner:
             lines.insert(0, f"docker inspect {self.spec.server.container_name}  (must exist and be running)")
         return lines
 
-    def _preflight(self, manifest: RunManifest, rungs: list[Rung]) -> None:
+    def _preflight(self, manifest: RunManifest, rungs: list[Rung]) -> list[Rung]:
+        """Safety, identity and feasibility checks. Returns the rung list,
+        rebuilt when ``context_rungs_tokens: auto`` resolves against the server."""
         safety_preflight(self.spec)
         site = load_site()
         manifest.site_config = describe_site()
@@ -1178,7 +1297,7 @@ class Runner:
             manifest.launch_check = {"checked": False, "warnings": warnings}
             if problems:
                 raise RunRefused("\n".join(problems), manifest)
-            return
+            return rungs
         if problems:  # stop before touching docker or the host
             raise RunRefused("\n".join(problems), manifest)
         self.fp = self._fingerprint()
@@ -1215,29 +1334,6 @@ class Runner:
                 )
         else:
             manifest.launch_check = {"checked": False, "reason": "no container fingerprint"}
-        # Feasibility against live MemAvailable on the bench host (the server
-        # is booted, so this already counts it and every other process).
-        try:
-            mem_now = self.ram_source.read_kib() / (1024 * 1024)
-        except Exception:  # noqa: BLE001
-            mem_now = None
-        feas = feasibility(self.spec, rungs, mem_now, "live")
-        manifest.launch_check["feasibility"] = {
-            "gpu": feas.gpu_status, "host": feas.host_status, "host_basis": feas.host_basis,
-            "mem_available_gib": round(mem_now, 2) if mem_now is not None else None,
-            "host_growth_gib": round(feas.host_need_gib, 2), "gpu_need_gib": round(feas.estimated_total_gib, 2),
-        }
-        warnings.extend(n for n in feas.notes if n.startswith("WARN"))
-        if not feas.ok:
-            problems.extend(feas.failures)
-        if self.hold is None:
-            warnings.append(
-                "WARN no safety.hold_command configured (site or spec): running without a bench lock, "
-                "so nothing stops another job from sharing the GPUs"
-            )
-        self.preflight_warnings = warnings
-        if problems:
-            raise RunRefused("\n".join(problems), manifest)
         log_text: str | None = None
         try:
             log_text = self._logs_text(tail=200000)
@@ -1252,9 +1348,87 @@ class Runner:
                 manifest.graph.graphs_basis = "boot_log"
             manifest.attention.actual = self.boot.attention_boot  # type: ignore[assignment]
             manifest.attention.evidence_lines = self.boot.evidence[:20]
+        rungs = self._resolve_ladder(manifest, rungs)
+        # Feasibility against live MemAvailable on the bench host (the server
+        # is booted, so this already counts it and every other process).
+        try:
+            mem_now = self.ram_source.read_kib() / (1024 * 1024)
+        except Exception:  # noqa: BLE001
+            mem_now = None
+        feas = feasibility(
+            self.spec, rungs, mem_now, "live", manifest.kv_capacity_tokens, manifest.kv_capacity_source or ""
+        )
+        manifest.launch_check["feasibility"] = {
+            "gpu": feas.gpu_status, "host": feas.host_status, "host_basis": feas.host_basis,
+            "mem_available_gib": round(mem_now, 2) if mem_now is not None else None,
+            "host_growth_gib": round(feas.host_need_gib, 2), "gpu_need_gib": round(feas.estimated_total_gib, 2),
+        }
+        manifest.launch_check["feasibility"]["ceiling_estimates"] = [
+            {"key": c.key, "users": c.users, "top_ok": c.top_ok, "stops_at": c.stops_at, "reason": c.reason}
+            for c in feas.ceilings
+        ]
+        warnings.extend(n for n in feas.notes if n.startswith("WARN"))
+        if feas.host_status in ("over", "tight"):
+            note = (
+                f"INFO host RAM estimate (never blocks): est. growth {feas.host_need_gib:.1f} GiB vs "
+                f"{feas.host_budget_gib:.1f} GiB above the floor ({feas.host_status}); a user count that hits the "
+                "live RAM floor stops there (CTX_CEILING)"
+            )
+            warnings.append(note)
+            manifest.notes.append(note)
+        if self.hold is None:
+            warnings.append(
+                "WARN no safety.hold_command configured (site or spec): running without a bench lock, "
+                "so nothing stops another job from sharing the GPUs"
+            )
+        self.preflight_warnings = warnings
+        if problems:
+            raise RunRefused("\n".join(problems), manifest)
         manifest.host = self._host()
         if manifest.hardware.host_ram_gib is None and manifest.host.get("host_ram_gib"):
             manifest.hardware.host_ram_gib = manifest.host["host_ram_gib"]  # measured MemTotal
+        return rungs
+
+    def _server_max_model_len(self) -> tuple[int | None, str | None]:
+        """max_model_len from /v1/models (vLLM), else from the boot log."""
+        try:
+            status, body = self.client.get_text(self.client._url("models"))
+            if status == 200:
+                for item in json.loads(body).get("data") or []:
+                    if item.get("max_model_len"):
+                        return int(item["max_model_len"]), "/v1/models"
+        except Exception:  # noqa: BLE001
+            pass
+        if self.boot and self.boot.max_model_len:
+            return self.boot.max_model_len, "boot_log"
+        return None, None
+
+    def _kv_capacity(self) -> tuple[int | None, str | None]:
+        """KV cache capacity in tokens: boot log line, else vllm:cache_config_info."""
+        if self.boot and self.boot.kv_tokens:
+            return self.boot.kv_tokens, "boot_log"
+        try:
+            status, body = self.client.get_text(self.spec.endpoint.metrics_url)
+            if status == 200 and (cap := kv_capacity_from_metrics(body)):
+                return cap, "metrics cache_config_info"
+        except Exception:  # noqa: BLE001
+            pass
+        return None, None
+
+    def _resolve_ladder(self, manifest: RunManifest, rungs: list[Rung]) -> list[Rung]:
+        """Resolve the context ladder against the live server (``auto`` grows
+        to max_model_len) and record max_model_len and KV capacity."""
+        mml, src = self._server_max_model_len()
+        manifest.max_model_len, manifest.max_model_len_source = mml, src
+        manifest.kv_capacity_tokens, manifest.kv_capacity_source = self._kv_capacity()
+        if manifest.context_rungs and manifest.completed_rung_ids:
+            ctxs, note = list(manifest.context_rungs), manifest.context_note or "resumed"
+        else:
+            ctxs, note = resolve_contexts(self.spec.ladder, mml)
+        manifest.context_rungs, manifest.context_note = ctxs, note
+        self._runlog(f"context rungs {ctxs} ({note})")
+        self.spec = with_contexts(self.spec, ctxs)
+        return build_schedule(self.spec)
 
     def _refuse(self, manifest: RunManifest, exc: Exception) -> RunRefused:
         manifest.status = "refused"
@@ -1277,8 +1451,13 @@ class Runner:
             else:
                 completed = set(manifest.completed_rung_ids)
                 prior_boot = (manifest.fingerprint or {}).get("started_at")
+                if manifest.context_rungs and completed:
+                    # Same ladder as the interrupted run, even if the server changed.
+                    self.spec = with_contexts(self.spec, manifest.context_rungs)
+                    rungs = build_schedule(self.spec)
         if manifest is None:
             manifest = self.new_manifest(_run_id(self.spec.name), rungs)
+            manifest.context_rungs, manifest.context_note = resolve_contexts(self.spec.ladder, None)
             if jsonl.exists():
                 jsonl.unlink()
             for extra in ("sessions.json", "greedy_outputs.jsonl", "logprob_scores.jsonl"):
@@ -1291,13 +1470,15 @@ class Runner:
 
         # Safety and identity before anything touches the server.
         try:
-            self._preflight(manifest, rungs)
+            rungs = self._preflight(manifest, rungs)
+            if not self.dry_run:
+                self._check_pre_run_load(manifest)
         except (SafetyError, RunRefused) as exc:
             raise self._refuse(manifest, exc) from None
         self._write_manifest(manifest)
         if not self.dry_run:
             for warn in self.preflight_warnings:
-                print(f"WARNING: {warn}", file=sys.stderr, flush=True)
+                print(warn if warn.startswith("INFO") else f"WARNING: {warn}", file=sys.stderr, flush=True)
 
         watcher = RamWatcher(floor_gib=self.spec.hardware.mem_available_floor_gib, source=self.ram_source, interval_s=0.5)
         try:
@@ -1355,6 +1536,11 @@ class Runner:
             for rung in rungs:
                 if rung.rung_id in completed:
                     continue
+                ckey = ceiling_key(rung)
+                if ckey in manifest.ctx_ceilings:
+                    continue  # this user count already hit its ceiling
+                if self._kv_precheck(manifest, run_id, rung, jsonl):
+                    continue
                 local: dict[int, Session] = {}
                 for sid in rung.live_sessions:
                     key = (rung.family, rung.load_mode, sid)
@@ -1373,7 +1559,7 @@ class Runner:
                             sess.load_state(saved[skey])
                         sessions[key] = sess
                     local[sid] = sessions[key]
-                extra_flags: list[str] = []
+                extra_flags: list[str] = ["PRE_EXISTING_LOAD"] if self._pre_load_flag else []
                 if refill_pending:
                     # Re-prefill every live session to its high-water context
                     # outside the window; never shrink, never rebuild smaller.
@@ -1406,6 +1592,8 @@ class Runner:
                         rung, local, [str(exc)], timed_out=False, since=time.time(), log_lines=[],
                         ram_floor=True, mem_min=watcher.min_gib(),
                     )
+                if self.spec.ladder.stop_at_ceiling and not self.dry_run and ceiling_reason(row):
+                    row.flags = [*row.flags, "CTX_CEILING"]
                 write_jsonl_row(jsonl, row)
                 self._runlog(
                     f"rung {row.rung_id} valid={row.valid} decode_tok_s_per_user={row.decode_tok_s_per_user} "
@@ -1417,6 +1605,21 @@ class Runner:
                     self._write_manifest(manifest)
                     continue
                 self._save_sessions(sessions)
+                why = ceiling_reason(row) if self.spec.ladder.stop_at_ceiling else None
+                if why:
+                    self._record_ceiling(manifest, rung, why, row.reason or "; ".join(row.errors)[:200])
+                    self._runlog(f"ceiling {ckey}: stops at {rung.ctx_per_user} ({why}); continuing with the next user count")
+                    if why == "ram_floor":
+                        # Passive protection stays: continue only once RAM is back above the floor.
+                        if not self._ram_recovered(watcher):
+                            abort_reason = f"RAM_FLOOR: MemAvailable did not recover after the {ckey} ceiling: {row.reason}"
+                            break
+                        watcher = self._restart_watcher(watcher)
+                    manifest.completed_rung_ids.append(rung.rung_id)
+                    self._write_manifest(manifest)
+                    continue
+                if row.valid != "invalid":
+                    manifest.ctx_reached[ckey] = max(manifest.ctx_reached.get(ckey, 0), rung.ctx_per_user)
                 if row.exit_reason in ABORTING_EXITS and row.valid == "invalid":
                     if row.exit_reason == "RAM_FLOOR" and self.ram_wait_min > 0 and self._wait_for_ram(watcher):
                         watcher = self._restart_watcher(watcher)
@@ -1449,6 +1652,130 @@ class Runner:
         if self.html and not self.dry_run:
             self._write_html(manifest)
         return manifest
+
+    def _pre_run_load(self) -> dict:
+        """Is the server already busy, or the GPU already loaded, before we start?
+
+        Two /metrics scrapes ``load_probe_s`` apart: requests running or
+        waiting (server busy), generation tokens produced in between or KV
+        cache in use (GPU loaded by this server's other clients). Read-only;
+        no process watching.
+        """
+        names = self.spec.metrics
+        try:
+            a = parse_prometheus(self._metrics_text())
+            self.sleep(self.load_probe_s)
+            b = parse_prometheus(self._metrics_text())
+        except Exception as exc:  # noqa: BLE001
+            return {"checked": False, "error": repr(exc)[:200]}
+        running = max(metric_value(a, names.running) or 0.0, metric_value(b, names.running) or 0.0)
+        waiting = max(metric_value(a, names.waiting) or 0.0, metric_value(b, names.waiting) or 0.0)
+        gen_a, gen_b = metric_value(a, names.generation_tokens), metric_value(b, names.generation_tokens)
+        gen_delta = (gen_b - gen_a) if gen_a is not None and gen_b is not None else None
+        kv_pct = kv_usage_pct(b, names)
+        server_busy = running > 0 or waiting > 0
+        gpu_loaded = bool(gen_delta and gen_delta > 0) or bool(kv_pct and kv_pct >= 1.0)
+        return {
+            "checked": True,
+            "probe_s": self.load_probe_s,
+            "requests_running": running,
+            "requests_waiting": waiting,
+            "generation_tokens_in_probe": gen_delta,
+            "kv_cache_usage_pct": kv_pct,
+            "server_busy": server_busy,
+            "gpu_loaded": gpu_loaded,
+            "loaded": server_busy or gpu_loaded,
+        }
+
+    def _check_pre_run_load(self, manifest: RunManifest) -> None:
+        """Warn and ask once if something is already running. Never blocks
+        unless the operator answers no; the starting load is recorded and
+        every row is flagged PRE_EXISTING_LOAD."""
+        load = self._pre_run_load()
+        manifest.pre_run_load = load
+        if not load.get("loaded"):
+            self._runlog("pre-run load: idle")
+            return
+        parts = []
+        if load["server_busy"]:
+            parts.append(f"server busy: {load['requests_running']:.0f} running, {load['requests_waiting']:.0f} waiting")
+        if load["gpu_loaded"]:
+            parts.append(
+                f"GPU loaded: {load['generation_tokens_in_probe'] or 0:.0f} tokens generated in "
+                f"{self.load_probe_s:.0f}s, KV cache {load['kv_cache_usage_pct'] or 0:.1f}%"
+            )
+        msg = "WARNING: pre-existing load before the run (" + "; ".join(parts) + "). Results will be flagged PRE_EXISTING_LOAD."
+        print(msg, file=sys.stderr, flush=True)
+        self._runlog(msg)
+        if self.assume_yes:
+            answer = True
+        elif self._confirm_fn is not None:
+            answer = self._confirm_fn(msg + " Run anyway? [y/N] ")
+        elif sys.stdin is not None and sys.stdin.isatty():
+            answer = input("Run anyway? [y/N] ").strip().lower() in ("y", "yes")
+        else:
+            answer = True  # non-interactive: warn, record, run
+        load["confirmed"] = answer
+        if not answer:
+            raise RunRefused("operator declined to run with pre-existing load (" + "; ".join(parts) + ")", manifest)
+        self._pre_load_flag = True
+        manifest.notes.append("PRE_EXISTING_LOAD: " + "; ".join(parts))
+
+    def _record_ceiling(self, manifest: RunManifest, rung: Rung, reason: str, detail: str) -> None:
+        key = ceiling_key(rung)
+        manifest.ctx_ceilings[key] = {
+            "family": rung.family,
+            "load_mode": rung.load_mode,
+            "users": rung.users,
+            "max_ok_ctx": manifest.ctx_reached.get(key),
+            "stopped_at": rung.ctx_per_user,
+            "reason": reason,
+            "detail": (detail or "")[:300],
+            "rung_id": rung.rung_id,
+        }
+
+    def _kv_precheck(self, manifest: RunManifest, run_id: str, rung: Rung, jsonl: Path) -> bool:
+        """Before sending anything: if this rung's live KV tokens exceed the
+        server's KV capacity, record the user count's ceiling (a CTX_CEILING
+        row, nothing sent) and return True."""
+        cap = manifest.kv_capacity_tokens
+        if self.dry_run or not self.spec.ladder.stop_at_ceiling:
+            return False
+        need = sum(rung.target_for(s) for s in rung.live_sessions) + len(rung.decoding_sessions) * rung.output_tokens
+        if cap and need > cap:
+            why = "kv_capacity"
+            reason = (
+                f"KV need {need:,} tokens ({rung.users} x {rung.ctx_per_user:,} + output) exceeds the server KV "
+                f"capacity {cap:,} tokens ({manifest.kv_capacity_source}); not sent"
+            )
+        else:
+            return False
+        utc, et = stamp_pair()
+        row = RungResult(
+            run_id=run_id, rung_id=rung.rung_id, users=rung.users, ctx_per_user=rung.ctx_per_user,
+            ctx_tokens=[], prompt_type=rung.prompt_type, load_mode=rung.load_mode, phase=rung.phase,
+            prompt_seed=self.spec.prompts.seed, temperature=self.spec.ladder.temperature, k=self.k_declared,
+            build_fingerprint=self.fp.build_fingerprint if self.fp else None,
+            started_utc=utc, started_local=et, finished_utc=utc, finished_local=et,
+            valid="invalid", reason=reason, exit_reason="CTX_CEILING", flags=["CTX_CEILING"],
+        )
+        write_jsonl_row(jsonl, row)
+        self._record_ceiling(manifest, rung, why, reason)
+        self._runlog(f"ceiling {ceiling_key(rung)}: {reason}")
+        manifest.completed_rung_ids.append(rung.rung_id)
+        self._write_manifest(manifest)
+        return True
+
+    def _ram_recovered(self, watcher: RamWatcher) -> bool:
+        """After a RAM-floor ceiling: MemAvailable back above floor + 0.5 GiB
+        (waiting up to --ram-wait minutes if set)."""
+        try:
+            now = self.ram_source.read_kib() / (1024 * 1024)
+        except Exception:  # noqa: BLE001
+            return False
+        if now >= self.spec.hardware.mem_available_floor_gib + 0.5:
+            return True
+        return self.ram_wait_min > 0 and self._wait_for_ram(watcher)
 
     def _read_remote(self, path: str) -> str | None:
         p = path[2:] if path.startswith("~/") else path

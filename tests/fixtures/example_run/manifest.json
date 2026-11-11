@@ -141,5 +141,94 @@
     ],
     "problems": [],
     "read_only": true
+  },
+  "max_model_len": 262144,
+  "max_model_len_source": "/v1/models",
+  "context_rungs": [
+    8192,
+    32768,
+    65536,
+    131072,
+    163840,
+    196608,
+    229376,
+    260096
+  ],
+  "context_note": "auto (synthetic, auto_step_tokens 32768): up to 260096 (max_model_len=262144 minus 1280 headroom)",
+  "kv_capacity_tokens": 720896,
+  "kv_capacity_source": "boot_log",
+  "ctx_ceilings": {
+    "long_form|closed_all_decoding|4": {
+      "family": "long_form",
+      "load_mode": "closed_all_decoding",
+      "users": 4,
+      "max_ok_ctx": 163840,
+      "stopped_at": 196608,
+      "reason": "kv_capacity",
+      "detail": "KV need 787,456 tokens (4 x 196,608 + output) exceeds the server KV capacity 720,896 tokens (boot_log); not sent",
+      "rung_id": "long_form:closed:4u:196608:C"
+    },
+    "long_form|closed_all_decoding|8": {
+      "family": "long_form",
+      "load_mode": "closed_all_decoding",
+      "users": 8,
+      "max_ok_ctx": 65536,
+      "stopped_at": 131072,
+      "reason": "kv_capacity",
+      "detail": "KV need 1,050,624 tokens (8 x 131,072 + output) exceeds the server KV capacity 720,896 tokens (boot_log); not sent",
+      "rung_id": "long_form:closed:8u:131072:C"
+    },
+    "code_edits|closed_all_decoding|4": {
+      "family": "code_edits",
+      "load_mode": "closed_all_decoding",
+      "users": 4,
+      "max_ok_ctx": 163840,
+      "stopped_at": 196608,
+      "reason": "kv_capacity",
+      "detail": "KV need 787,456 tokens (4 x 196,608 + output) exceeds the server KV capacity 720,896 tokens (boot_log); not sent",
+      "rung_id": "code_edits:closed:4u:196608:C"
+    },
+    "code_edits|closed_all_decoding|8": {
+      "family": "code_edits",
+      "load_mode": "closed_all_decoding",
+      "users": 8,
+      "max_ok_ctx": 65536,
+      "stopped_at": 131072,
+      "reason": "kv_capacity",
+      "detail": "KV need 1,050,624 tokens (8 x 131,072 + output) exceeds the server KV capacity 720,896 tokens (boot_log); not sent",
+      "rung_id": "code_edits:closed:8u:131072:C"
+    },
+    "multi_turn_chat|closed_all_decoding|4": {
+      "family": "multi_turn_chat",
+      "load_mode": "closed_all_decoding",
+      "users": 4,
+      "max_ok_ctx": 163840,
+      "stopped_at": 196608,
+      "reason": "kv_capacity",
+      "detail": "KV need 787,456 tokens (4 x 196,608 + output) exceeds the server KV capacity 720,896 tokens (boot_log); not sent",
+      "rung_id": "multi_turn_chat:closed:4u:196608:C"
+    },
+    "multi_turn_chat|closed_all_decoding|8": {
+      "family": "multi_turn_chat",
+      "load_mode": "closed_all_decoding",
+      "users": 8,
+      "max_ok_ctx": 65536,
+      "stopped_at": 131072,
+      "reason": "kv_capacity",
+      "detail": "KV need 1,050,624 tokens (8 x 131,072 + output) exceeds the server KV capacity 720,896 tokens (boot_log); not sent",
+      "rung_id": "multi_turn_chat:closed:8u:131072:C"
+    }
+  },
+  "ctx_reached": {},
+  "pre_run_load": {
+    "checked": true,
+    "probe_s": 2.0,
+    "requests_running": 0.0,
+    "requests_waiting": 0.0,
+    "generation_tokens_in_probe": 0.0,
+    "kv_cache_usage_pct": 0.0,
+    "server_busy": false,
+    "gpu_loaded": false,
+    "loaded": false
   }
 }

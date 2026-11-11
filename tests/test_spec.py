@@ -29,7 +29,8 @@ def test_quick_profile_shortens_ladder() -> None:
     assert spec.ladder.context_rungs_tokens == [8192, 32768]
     assert spec.ladder.load_modes == ["closed_all_decoding"]
     assert spec.ladder.output_tokens_per_rung == 96  # was 32; 32 tokens is ~8 MTP verify steps (SHORT_WINDOW)
-    assert spec.ladder.target_minutes == 10.0
+    assert spec.ladder.target_minutes == 12.0
+    assert spec.ladder.join_max_context_tokens == 8192  # 2/4/8 users stay at 8K in quick
 
 
 def test_variant_overlay_changes_env() -> None:

@@ -6,6 +6,8 @@ import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from pathlib import Path
 
+import pytest
+
 from test_runner_harness import _runner, _spec
 from xpu_llm_bench import launch
 from xpu_llm_bench.cli import main
@@ -73,7 +75,7 @@ def test_example_report_is_valid_and_self_contained() -> None:
     for title in ("Decode speed", "Prefill speed", "Time to first token", "Verify steps",
                   "MTP accepted drafts per step", "True hit rate"):
         assert title in doc
-    assert "tok/s per user" in doc and "context per user (tokens)" in doc
+    assert "tok/s per user" in doc and "context per user (tokens" in doc
     # numbers table has every row
     assert doc.count("<tr") >= len(rows) + 1
 
@@ -90,7 +92,84 @@ def test_one_series_per_concurrency() -> None:
     decode = next(b for t, b in charts if t.startswith("Decode speed"))
     assert sorted(set(re.findall(r'<path class="s u(\d+) r0"', decode)), key=int) == ["1", "2", "4", "8"]
     # x axis follows the ladder contexts
-    assert all(lab in decode for lab in (">8K<", ">32K<", ">64K<", ">131K<"))
+    assert all(lab in decode for lab in (">8K<", ">32K<", ">64K<", ">131K<", ">163K<", ">196K<", ">260K<"))
+
+
+def _points(body: str, users: int) -> list[tuple[float, str]]:
+    return [(float(cx), t) for cx, t in re.findall(
+        rf'<circle cx="([\d.]+)"[^>]*data-users="{users}"[^>]*><title>([^<]*)</title>', body)]
+
+
+def test_lines_end_at_each_user_count_ceiling() -> None:
+    rows, man = _example()
+    doc = render_html(rows, man)
+    charts = re.findall(r'<div class="card"><h3>(.*?)</h3>(.*?)</div>', doc, flags=re.S)
+    decode = next(b for t, b in charts if t.startswith("Decode speed"))  # first group
+    last = {u: max(_points(decode, u))[1] for u in (1, 2, 4, 8)}
+    assert "260K context" in last[1] and "260K context" in last[2]
+    assert "163K context" in last[4] and "64K context" in last[8]
+    marks = re.findall(r'<g class="ceil-mark" data-users="(\d+)"><title>([^<]*)</title>', decode)
+    assert sorted(u for u, _ in marks) == ["4", "8"]
+    tip4 = next(t for u, t in marks if u == "4")
+    assert "Last measured 163K; stopped at 196K (kv_capacity)" in tip4 and "exceeds the server KV capacity" in tip4
+    # log-scaled x axis: 8K->32K (2 doublings) is twice as wide as 32K->64K (1 doubling)
+    xs = sorted({x for x, _ in _points(decode, 1)})
+    assert abs((xs[1] - xs[0]) - 2 * (xs[2] - xs[1])) < 1.0
+    assert "log scale" in decode
+
+
+def test_header_shows_max_model_len_and_per_user_ceilings() -> None:
+    rows, man = _example()
+    doc = render_html(rows, man)
+    assert "max_model_len 262144 (from /v1/models)" in doc
+    assert "720,896 tokens (from boot_log)" in doc
+    reach = doc[doc.index("Context reached per user count"):doc.index("Server launch")]
+    assert "<td>1</td><td>260K</td><td>reached the top rung</td>" in reach
+    assert "<td>4</td><td>163K</td><td>stopped at 196K (kv_capacity)</td>" in reach
+    assert "<td>8</td><td>64K</td><td>stopped at 131K (kv_capacity)</td>" in reach
+    assert "SYNTHETIC" in json.dumps(man.notes)
+
+
+def test_group_headings_and_quality_pass_counts() -> None:
+    from xpu_llm_bench.html_report import quality_line
+
+    rows, man = _example()
+    doc = render_html(rows, man)
+    assert "<h3>Code edits, closed loop</h3>" in doc and "<h3>Multi-turn chat, closed loop</h3>" in doc
+    assert "code_edits · closed_all_decoding" not in doc
+    code = [r for r in rows if r.prompt_type == "code_edits"]
+    line = quality_line(code)
+    ran = [r for r in code if r.quality.code_edit_pass is not None]
+    assert f"Code edit: {len(ran) - 1} of {len(ran)} pass" in line
+    assert line.startswith("Code edit:") and "Greedy match:" in line and "Logprob: ok" in line
+    assert f"<b>Quality:</b> {line}" in doc  # above the group
+    assert "<b>Quality, all rows:</b>" in doc  # overall, at the top
+    allnum = doc[doc.index("<h2>All numbers</h2>"):]
+    assert "Quality pass counts per group" in allnum and f"Code edits, closed loop: {line}" in allnum
+    # checks that never ran are skipped, None is not-run
+    long_form = quality_line([r for r in rows if r.prompt_type == "long_form"])
+    assert "Code edit" not in long_form
+
+
+def test_averages_across_prompt_types() -> None:
+    from xpu_llm_bench.html_report import average_rows
+
+    rows, man = _example()
+    avg, table = average_rows(rows)
+    by = {(t["users"], t["ctx"]): t for t in table}
+    # 1 user at 8K: every prompt type clean -> plain mean of the three
+    one = [r for r in rows if r.users == 1 and r.ctx_per_user == 8192]
+    assert len(one) == 3
+    assert by[(1, 8192)]["decode_tok_s_per_user"] == pytest.approx(sum(r.decode_tok_s_per_user for r in one) / 3)
+    # a cell where any prompt type is flagged or failed is left out
+    assert (2, 32768) not in by  # NOT_AS_LABELED in multi_turn_chat
+    assert (4, 65536) not in by  # QSA_FALLBACK in code_edits
+    assert (8, 8192) not in by  # HIT_RATE_UNKNOWN
+    assert (4, 196608) not in by  # past the ceiling
+    doc = render_html(rows, man)
+    assert "<h2>Averages across prompt types</h2>" in doc and "Flagged and invalid rows are excluded" in doc
+    assert "<h3>Average across prompt types, closed loop</h3>" in doc
+    assert len(avg) == len(table)
 
 
 def test_flagged_points_are_hollow_with_tooltip() -> None:

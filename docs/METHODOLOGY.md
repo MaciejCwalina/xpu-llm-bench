@@ -21,19 +21,66 @@ progressive ladder and the true hit-rate definition below.
 One boot per config. `max-num-seqs` must cover the largest concurrency step.
 Never restart to change concurrency.
 
-**Phase S (session growth).** Session 1 grows through every context rung
-(8K → 32K → 64K → 131K by default) in **one conversation**. Each growth
-appends a new user turn of fresh corpus text. After each measured window the
-model's own reply, cut at EOS, is appended as the assistant turn. Earlier
-turns are never edited, so the rendered prefix is stable and the prefix cache
-is reused. The conversation is never refilled from scratch and never
-shrinks. One measured rung per context.
+**Context rungs.** `ladder.context_rungs_tokens: auto` (the default) builds
+8K, 32K, 64K, 131K, then +64K steps (196K, 262K) and doubling beyond 262K
+(524K, 1M, ...; `auto_step_tokens` / `auto_step_mode` change this), up to the
+server's `max_model_len` minus `ctx_headroom_tokens` (default: output window +
+1024), with that maximum as the final rung. `max_model_len` is read at
+preflight from `/v1/models` (vLLM reports it per model), else from the boot
+log. `ladder.max_context` caps the ladder; an explicit list still works and
+rungs above the limit are dropped. `bench plan` cannot ask the server, so it
+shows up to 131K unless given `--max-model-len`. The resolved rungs are stored
+in the manifest (`context_rungs`) and a `--resume` keeps them.
 
-**Phase C (sessions join).** With session 1 kept at its high-water context,
-sessions join **one at a time** at `join_ctx_tokens` (default: the first rung,
-8K). Each joiner prefills on its own. A rung is measured at every
-concurrency step > 1 (2, 4, 8), with **every live session decoding in the
-window**. Earlier sessions are genuinely live, not quiesced.
+**Fill.** Each rung is filled to its target: the new user turn is sized from a
+chars-per-token estimate, then counted with the server's own tokenizer
+(`/tokenize` with the chat messages, template included) and topped up or
+trimmed before anything is sent, to within 1%. Rows record the tokens the
+server reported (`ctx_tokens`) and `ctx_fill_pct`; a row more than 2% off
+(no tokenizer available) is flagged `CTX_FILL_OFF`.
+
+**Phase S (session growth).** Session 1 grows through every context rung, up
+to the top rung, in **one conversation**. Each growth appends a new user turn
+of fresh corpus text. After each measured window the model's own reply, cut at
+EOS, is appended as the assistant turn. Earlier turns are never edited, so the
+rendered prefix is stable and the prefix cache is reused. The conversation is
+never refilled from scratch and never shrinks. One measured rung per context.
+
+**Phase C (users join and climb).** For each concurrency step n > 1 (2, 4, 8),
+n users join at `join_ctx_tokens` (default: the first rung, 8K), each
+prefilling on its own, and then grow **together** rung by rung, with every one
+of the n users decoding in each window, until the top rung or that user
+count's ceiling. Each user count has its own conversations, so all n users sit
+at the same context and every concurrency gets one clean curve to the
+maximum. Conversations still only grow (append-only, prefix reuse); the
+previous user count's conversations are released, never shrunk or refilled.
+(Before this change session 1 stayed live at the top context while joiners sat
+at 8K, which capped multi-user rows at the first rung.) The quick profile
+keeps 2/4/8 users at 8K (`join_max_context_tokens: 8192`).
+
+**Context ceilings.** A user count stops climbing when the next rung does not
+fit, and the run records it instead of failing:
+- `kv_capacity`: the rung's live KV tokens (n × context + n × output) exceed
+  the server's KV capacity (boot log `KV cache size: N tokens`, else
+  `vllm:cache_config_info` blocks × block size). Checked before sending, so
+  nothing is sent; the row has exit reason `CTX_CEILING`.
+- `server_rejected_context`: the server refuses the request length.
+- `ram_floor` / `oom`: MemAvailable hit the floor or the engine was OOM-killed
+  during the rung. After a RAM-floor ceiling the run continues only once
+  MemAvailable is back above the floor (+0.5 GiB, waiting up to
+  `--ram-wait-min`), otherwise it aborts.
+The failed rung is flagged `CTX_CEILING`, the manifest records
+`ctx_ceilings["<prompt type>|<load mode>|<users>"] = {max_ok_ctx, stopped_at,
+reason, detail}`, the remaining rungs of that user count are skipped, and the
+next user count starts with its own ceiling logic. `ladder.stop_at_ceiling:
+false` restores the old behaviour (abort on the first failure).
+
+**Pre-run load.** Before the first rung the runner scrapes `/metrics` twice,
+about 2 s apart. If requests are running or waiting (server busy) or tokens
+were generated / KV is in use in between (GPU loaded), it warns and asks once
+(`--yes` answers yes; a non-interactive run proceeds), records
+`manifest.pre_run_load` and flags every row `PRE_EXISTING_LOAD` (a `warning`
+row). Nothing else is watched.
 
 **Prompt types.** `code_edits`, `long_form` (writing), and `multi_turn_chat`
 are separate families with separate sessions. Within a family, context
@@ -46,32 +93,31 @@ mode.
 
 **Profiles.**
 
-| | quick (≈ 8–10 min by the planner's assumptions) | full |
+| | quick (≈ 11 min by the planner's conservative rates) | full |
 |---|---|---|
-| contexts | 8K, 32K | 8K, 32K, 64K, 131K |
-| users | 1 (S), 2/4/8 (C) | 1 (S), 2/4/8 (C) |
+| contexts | 8K, 32K | auto: 8K … the server's max context |
+| users | 1 (S, to 32K), 2/4/8 (C, at 8K) | 1 (S), 2/4/8 (C), each to its ceiling |
 | prompt types | all three | all three |
 | load modes | closed | closed, staggered |
 | window | 96 tokens | 256 tokens |
 
+The quick preset on a typical 2-GPU box: 15 rungs, at most 8 × 8K = 64K live
+tokens (well inside any 2 × 24 GiB KV budget), session 1 alone at 32K. It is a
+smoke test of the whole pipeline, not a context sweep; use `full` (or a
+shipped spec) for the climb to max context.
+
 `bench plan` prints the order, per-session contexts, a wall-time estimate
-from `planner.assumed_*` (not measured), and a GPU / host-RAM feasibility
-check, and exits 1 when the plan cannot fit:
-- GPU: weights + KV(peak live tokens) + device overhead against
-  `gpu_count × gpu_mem_gib` (FAIL above 95%, WARN above 85%).
-- Host: RAM growth over the run, peak live tokens ×
+from `planner.assumed_*` (not measured), the context rungs, a **per-user-count
+context ceiling estimate** (from the KV capacity: `--kv-capacity-tokens`, or
+`hardware.gpu_*` with `planner.assumed_*`), and GPU / host-RAM estimates.
+**None of the estimates block a run** (exit 0); they are information:
+- GPU: weights + KV(peak live tokens of the rungs estimated to fit) + device
+  overhead against `gpu_count × gpu_mem_gib` (WARN when over).
+- Host RAM: growth over the run, peak live tokens ×
   `planner.host_bytes_per_token` (ESTIMATE, default 64 KiB) plus any
-  host-resident KV share (`planner.host_kv_fraction`), against **live
-  MemAvailable minus the floor** (`hardware.mem_available_floor_gib`,
-  default 2 GiB; both settable in the site config). MemAvailable already
-  counts the booted server and every other process on the host. FAIL if
-  over, WARN within `planner.host_tight_gib`. The reading comes from
-  `bench plan --mem-available GIB`, `--measured results.jsonl` (baseline
-  MemAvailable of an earlier run), or `/proc/meminfo` when `access.mode:
-  local`; a live run re-checks at preflight. With no reading the host check
-  is UNVERIFIED (a warning), never OK.
-- GPU facts (`gpu_count`, `gpu_mem_gib`) come from the spec or the site
-  config `hardware:` block; when unset the GPU check is skipped with a warning.
+  host-resident KV share, against live MemAvailable minus the floor. Shown on
+  one line in the plan and as an `INFO` note in the manifest at preflight.
+  The live RAM floor during the run is what stops a user count.
 
 **Resume.** After each rung the runner saves `manifest.json` (with
 `completed_rung_ids`) and `sessions.json` (a compact record of every

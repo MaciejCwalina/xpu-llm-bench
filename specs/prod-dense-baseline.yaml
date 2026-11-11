@@ -49,7 +49,7 @@ prompts:
 ladder:
   # Progressive: session 1 grows through every context rung, then users join.
   shape: session1_then_join
-  context_rungs_tokens: [8192, 32768, 65536, 131072]  # add 262144 when a full 260K rung is wanted
+  context_rungs_tokens: auto  # 8K, 32K, 64K, 131K, 196K, 262K, ... up to the server max_model_len
   concurrency_steps: [1, 2, 4, 8]
   load_modes: [closed_all_decoding, staggered, open_loop]
   output_tokens_per_rung: 128

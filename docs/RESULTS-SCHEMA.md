@@ -6,7 +6,7 @@ A run writes these files under `--output-dir/<spec-name>/`:
 - `results.jsonl`: one JSON object per measured rung, in schedule order.
 - `launch.json`: the server's start command and settings, captured read-only at preflight (also `manifest.launch`). Fields: `captured_utc`, `captured_local`, `display_timezone`, `endpoint`, `source` (`docker_inspect` / `process_cmdline` / `none`), `container`, `image`, `image_id`, `repo_digests`, `entrypoint`, `cmd`, `args`, `command_line`, `env` (name → value, secrets `<redacted>`), `devices`, `group_add`, `ipc_mode`, `shm_size`, `network_mode`, `port_bindings`, `restart_policy`, `container_started_at`, `vllm_boot_config` (vLLM's "non-default args" / engine-config log lines, redacted), `problems`, `read_only`.
 - `run.log`: human-readable launch header (UTC and local time), then one line per rung and the final status.
-- `report.html`: self-contained HTML report with inline SVG charts (`bench report --html`; written at the end of every real run unless `--no-html`).
+- `report.html`: self-contained HTML report with inline SVG charts (`bench report --html`; written at the end of every real run unless `--no-html`): log-scaled context axis for wide ladders, a ceiling marker where each user count stopped, quality pass counts per group, and averages across prompt types over clean rows.
 - `sessions.json`: a compact record of every live conversation, used by `--resume` to re-prefill: user turns as (segment, n_chars, opener, sha256), regenerated from the seeded corpus on load; model replies verbatim. Never edit it. Not written by `--dry-run`.
 - `dry-run/`: a `--dry-run` writes its own `manifest.json` (`status: dry_run`, `planned_rung_ids`) and `DRY_RUN` rows here, never next to a real run.
 - `greedy_outputs.jsonl`: greedy window outputs (`probe_id`, token ids, text). This is the MTP on/off reference.
@@ -35,6 +35,13 @@ fails if it drifts. Every timestamp is recorded twice: UTC (`*_utc`) and the dis
 | `host` | sysfs GPU ids/driver, kernel, oneAPI / level-zero package versions (no xpu-smi) |
 | `hold` | bench-hold status before, our acquire, status after, release (`{"skipped": ...}` when no `hold_command` is configured). The default hold name is the run id (`<spec name>-<utc stamp>-…`), so copies of a spec never share a hold. |
 | `launch` | Server start command and settings captured read-only at preflight (same as `launch.json`; secrets redacted). |
+| `max_model_len`, `max_model_len_source` | The server's max context and where it was read (`/v1/models` or `boot_log`). |
+| `context_rungs`, `context_note` | The context ladder this run used (`auto` resolved) and how it was derived. `--resume` keeps it. |
+| `kv_capacity_tokens`, `kv_capacity_source` | Server KV capacity in tokens (`boot_log` "KV cache size", or `metrics cache_config_info`). |
+| `ctx_ceilings` | Per `"<prompt type>\|<load mode>\|<users>"`: `{family, load_mode, users, max_ok_ctx, stopped_at, reason, detail, rung_id}`; reason is `kv_capacity`, `server_rejected_context`, `ram_floor` or `oom`. |
+| `ctx_reached` | Highest context each `"<prompt type>\|<load mode>\|<users>"` line measured successfully. |
+| `pre_run_load` | Two `/metrics` scrapes ~2 s apart before the first rung: `requests_running`, `requests_waiting`, `generation_tokens_in_probe`, `kv_cache_usage_pct`, `server_busy`, `gpu_loaded`, `loaded`, `confirmed`. |
+| `notes` | Free-text notes, including the informational host-RAM estimate (`INFO host RAM estimate (never blocks)`) and `PRE_EXISTING_LOAD`. |
 | `graph` | `graphs_declared` (from the spec's graph mode, or null), `graphs_on` (true/false only from boot-log evidence, else null) and `graphs_basis` (`boot_log` / `unknown`). Dry runs never claim graphs on. |
 | `corpus_files` | sha256 of each corpus file when `prompts.corpus_dir` is used |
 | `first_greedy_divergence` | First probe and token where MTP-on output left the reference |
@@ -58,8 +65,9 @@ Fields on the row that are not in the table: `session_seeds`, `temperature`,
 `draft_tokens`, `accepted_drafts`, `drafts`, `prefill_tokens`,
 `attention_evidence`, and timestamps.
 
-- `rung_id` is `{prompt_type}:{load_short}:{users}u:{ctx}:{phase}`, where phase is `S` (session-1 growth), `C` (joiners), or `meas` (grid shape).
-- `ctx_tokens` lists the context of every live decoding session. `ctx_per_user` is the rung's nominal target.
+- `rung_id` is `{prompt_type}:{load_short}:{users}u:{ctx}:{phase}`, where phase is `S` (session-1 growth), `C` (a user count climbing), or `meas` (grid shape).
+- `ctx_tokens` lists the context of every live decoding session as reported by the server (`prompt_tokens`). `ctx_per_user` is the rung's target; `ctx_fill_pct` is mean(`ctx_tokens`) / target × 100 (filled to within ~1% when the server has `/tokenize`).
+- A `CTX_CEILING` row with `exit_reason: CTX_CEILING` was never sent (KV capacity check); other ceiling rows keep the failure's exit reason and carry the `CTX_CEILING` flag.
 - `quality` holds needle, code-edit, format/repetition, greedy reference/divergence, and logprob scores. Unchecked items are null.
 - `valid` is `valid`, `warning` (see METHODOLOGY §6), or `invalid`.
 - `exit_reason` is set only on failed rungs.
@@ -83,6 +91,9 @@ Fields on the row that are not in the table: `session_seeds`, `temperature`,
 | `FOREIGN_STACK` | Another vLLM stack (different container) is resident on the host. |
 | `PROTECTED_PORT` | Server bound to a protected production port (only possible on imported rows). |
 | `RAM_FLOOR` | MemAvailable hit the floor; runner guard aborted. |
+| `CTX_CEILING` | This user count's context ceiling: the rung did not fit (KV capacity, the server rejected the context, RAM floor or OOM). The user count stops here; the run continues with the next one. |
+| `CTX_FILL_OFF` | Filled context more than 2% from the rung target (no server tokenizer to top up). |
+| `PRE_EXISTING_LOAD` | The server was busy or the GPU loaded when the run started (manifest `pre_run_load`); the row is a `warning`. |
 | `OOM` | Out-of-memory (container OOMKilled or OOM lines in logs). |
 | `SPEC_ASSERT` | Known assert: Expected spec_token == num_spec_decodes * (num_speculative_tokens + 1). |
 | `ENGINE_ERROR` | Engine error / traceback in logs or HTTP 5xx. |

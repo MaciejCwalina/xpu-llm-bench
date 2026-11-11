@@ -78,8 +78,8 @@ test container; the harness measures it and checks it is what the spec says.
 5. **Check, dry-run, then run:**
 
    ```bash
-   bench plan my-spec.yaml               # order, time, GPU/RAM feasibility (exit 1 if it cannot fit)
-   bench plan my-spec.yaml --mem-available 20   # host RAM check against MemAvailable (GiB) read on the bench host
+   bench plan my-spec.yaml               # order, time, GPU/RAM estimates (information only; never blocks)
+   bench plan my-spec.yaml --max-model-len 262144 --kv-capacity-tokens 700000   # full auto ladder + per-user-count ceilings
    bench run my-spec.yaml --dry-run      # plan + the exact safety commands; writes only <out>/<spec>/dry-run/
    bench run my-spec.yaml --output-dir results
    bench report results/<spec-name>      # markdown on stdout
@@ -196,16 +196,27 @@ Every run directory describes itself:
   scripts, no CDN, no network assets; opens offline; follows the system light/dark
   setting). For decode tok/s, prefill tok/s, TTFT, verify steps/s, accepted drafts
   per step and true hit rate it draws one chart per prompt type and load mode:
-  X = context per user (ladder order), Y = the metric, one line per concurrency
-  (users), so you see the family of curves as both grow. Hover a point for the exact
-  value. Flagged rows (`NOT_AS_LABELED`, `QSA_FALLBACK`, `GRAPH_MISS`,
+  X = the context rungs that ran (log scale when they span a wide range, e.g. 8K to
+  262K), Y = the metric, one line per concurrency (users), so you see the family of
+  curves as both grow. A line ends at its user count's context ceiling, with a marker
+  whose tooltip gives the reason. Hover a point for the exact value. Group headings are
+  plain words ("Code edits, closed loop") with the group's quality pass counts above the
+  charts ("Code edit: 5 of 5 pass · Needle: 9 of 10 pass · Format: 6 of 6 pass · Greedy
+  match: 4 of 5 · Logprob: ok 3 of 3"; checks that never ran are left out), an overall
+  count at the top, and the same per-group counts above the "All numbers" table. An
+  "Averages across prompt types" table and chart group average decode tok/s, steps/s,
+  accepted drafts/step, true hit rate, TTFT and prefill over the prompt types for every
+  users × context cell where each prompt type has a clean row (flagged and invalid rows
+  are excluded). Flagged rows (`NOT_AS_LABELED`, `QSA_FALLBACK`, `GRAPH_MISS`,
   `HIT_RATE_UNKNOWN`, ...) and invalid rows are drawn hollow and list their flags.
   The spec-decode charts are replaced by a note when the run has no speculative
   decoding. A header shows the run fingerprint (image, attention path from logs, KV
-  format, graphs and capture sizes, spec method and k, hardware, timestamps, the
-  captured start command) and caveats; a full numbers table follows the charts.
-  `python scripts/make_example_report.py out.html` renders an example from
-  synthetic data.
+  format, graphs and capture sizes, spec method and k, hardware, timestamps,
+  max_model_len and the context rungs, KV capacity, the pre-run load, how far each user
+  count got, the captured start command) and caveats; a full numbers table follows the
+  charts. `python scripts/make_example_report.py out.html` renders an example from
+  synthetic data. `bench report` on a refused or empty run says so, with the reason
+  from the manifest.
 
 **Headline speed is verify steps/s per user, shown next to decode tok/s.**
 The true hit rate is `(delivered − verify_steps) / (k × verify_steps)`, with k
@@ -218,18 +229,30 @@ Each rung records:
 - **What actually ran:** the attention path, graphs, k and KV dtype, read from server logs rather than flags, plus a build fingerprint (image id + hash of every mount)
 - **Seed:** the fixed prompt seed
 - **Quality:** logprob vs a dense baseline, MTP on/off greedy divergence, needle, code-edit unit test, format/repetition
-- **Outcome:** an exit reason (`RAM_FLOOR` / `OOM` / `SPEC_ASSERT` / `ENGINE_ERROR`) and flags
+- **Outcome:** an exit reason (`RAM_FLOOR` / `OOM` / `SPEC_ASSERT` / `ENGINE_ERROR` / `CTX_CEILING`) and flags
+- **Context:** the tokens actually filled per session (`ctx_tokens`, `ctx_fill_pct`), the server's `max_model_len` and KV capacity, and each user count's context ceiling
 
 The ladder is progressive, with one boot per config, for every profile
-(including `custom`):
-1. Session 1 grows 8K → 32K → 64K → 131K in one conversation. It is never refilled and never shrunk.
-2. Sessions 2…8 then join one at a time while session 1 stays live, and every live session decodes in each window.
+(including `custom`), and it goes to the server's maximum context:
+1. Session 1 grows 8K → 32K → 64K → 131K → 196K → 262K → … in one conversation, up to the
+   server's `max_model_len` (read from `/v1/models`, else the boot log) minus room for the
+   output. It is never refilled and never shrunk.
+2. Then 2, 4 and 8 users join at 8K and grow together, rung by rung, all decoding in every
+   window, until the top rung or until that user count stops fitting.
+3. A user count stops at its **context ceiling**: the rung needs more KV than the server has
+   (checked before sending, from the boot log `KV cache size` or `vllm:cache_config_info`), the
+   server rejects the context length, or the RAM floor / OOM hits. The run records `CTX_CEILING`
+   with the reason and moves on to the next user count instead of failing.
+
+`context_rungs_tokens: auto` is the default (`ladder.max_context` caps it, and an explicit
+list still works). Each rung is filled to its target within about 1% using the server's own
+tokenizer (`/tokenize`), before anything is sent.
 
 The old grid order (every user at once at the first rung, then step down) is
 refused unless a spec sets both `ladder.shape: grid` and `ladder.allow_grid: true`,
 and then `bench plan` / `bench run` print a loud warning.
 
-There are three prompt types (code edit, writing, chat) and two load levels (all decoding together, or staggered arrivals). `--resume` continues from the last completed rung. The `quick` profile (1/2/4/8 users × 8K/32K × 3 types) is about 10 minutes. Details are in [docs/METHODOLOGY.md](docs/METHODOLOGY.md); columns and flags are in [docs/RESULTS-SCHEMA.md](docs/RESULTS-SCHEMA.md).
+There are three prompt types (code edit, writing, chat) and two load levels (all decoding together, or staggered arrivals). `--resume` continues from the last completed rung. The `quick` profile (session 1 to 32K, then 2/4/8 users at 8K, × 3 types: 15 rungs) is about 11 minutes by the planner's conservative rates; `full` and the shipped specs climb to the server's max context. Details are in [docs/METHODOLOGY.md](docs/METHODOLOGY.md); columns and flags are in [docs/RESULTS-SCHEMA.md](docs/RESULTS-SCHEMA.md).
 
 ## Example specs
 
@@ -253,8 +276,9 @@ These rules are enforced in code, and the tests check them:
 - Refuses any endpoint on a protected production port and any protected production container or service, plus CI-runner containers. The real names and ports come from an untracked site config (`bench-site.local.yaml`, `~/.config/xpu-llm-bench/site.yaml`, or `$XPU_BENCH_SITE`; see [`bench-site.example.yaml`](bench-site.example.yaml)). Site values only add protection; the built-in neutral defaults (`vllm-production`, port 8001) always apply. `$BENCH_HOST` can name the host for SSH access.
 - Never starts, stops or restarts a container.
 - `bench-hold` (optional, when `hold_command` is set): checks `status` first and **refuses if anyone else holds it**, because `acquire` silently overwrites. Also refuses an active operator quiet hold (optional file, from site config). It then acquires under a per-run name (the run id, unless `safety.hold_name` is set), confirms, renews while it still owns the hold, and releases only its own hold. Without a `hold_command` the quiet hold is still honored.
-- Preflight stops (exit 3, manifest `status: refused`) on: no site config, `TODO`/`<...>` spec values, a missing or stopped test container, a planner GPU/RAM failure (host RAM against live `MemAvailable` minus the floor), a variant A/B that would share one endpoint, or a bench-hold held by someone else.
-- Aborts at a `MemAvailable` floor, 2 GiB by default (`hardware.mem_available_floor_gib`; `--resume` continues).
+- Preflight stops (exit 3, manifest `status: refused`) on: no site config, `TODO`/`<...>` spec values, a missing or stopped test container, a variant A/B that would share one endpoint, or a bench-hold held by someone else. GPU and host-RAM **estimates never block** a run, a user count or a bigger ladder; they are printed and noted in the manifest.
+- Pre-run load check: if the server is already busy (`/metrics` running or waiting requests) or the GPU already loaded (tokens generated over ~2 s, KV in use), it warns and asks once (`--yes` skips the question; a non-interactive run proceeds). The starting load goes into the manifest (`pre_run_load`) and every row is flagged `PRE_EXISTING_LOAD`. No process watching.
+- A live `MemAvailable` floor, 2 GiB by default (`hardware.mem_available_floor_gib`), stops the user count that hits it (`CTX_CEILING`, reason `ram_floor`); the run continues only once MemAvailable is back above the floor, otherwise it aborts (`--resume` continues).
 - Never runs `xpu-smi`, not even discovery.
 - API keys come from the environment only.
 

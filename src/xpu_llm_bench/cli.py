@@ -68,6 +68,20 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="GIB",
         help="Current MemAvailable on the bench host (GiB) with the test server booted",
     )
+    plan.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        metavar="TOKENS",
+        help="Server max_model_len, to show the full `auto` context ladder (a live run reads it from /v1/models)",
+    )
+    plan.add_argument(
+        "--kv-capacity-tokens",
+        type=int,
+        default=None,
+        metavar="TOKENS",
+        help="Server KV cache capacity in tokens (boot log 'KV cache size: N tokens'), for per-user-count ceilings",
+    )
     _add_profile(plan)
 
     run = sub.add_parser("run", help="Drive the ladder against an OpenAI-compatible endpoint")
@@ -78,6 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Safety preflight + plan + placeholder rows. No HTTP, no bench-hold, no GPU.",
+    )
+    run.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Run without asking when the server is already busy or the GPU already loaded (still flagged)",
     )
     run.add_argument(
         "--ram-wait-min",
@@ -172,6 +192,26 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(str(exc), 2)
 
 
+def _no_results(run_path: Path, manifest: RunManifest | None) -> int:
+    """`bench report` on a run with no rows: say why instead of a raw I/O error."""
+    where = run_path.parent
+    if manifest is None:
+        print(f"no results in {where}: no results.jsonl and no manifest.json (not a run directory?)", file=sys.stderr)
+        return 2
+    status = manifest.status
+    reason = (manifest.abort_reason or "").strip()
+    if status == "refused":
+        msg = f"run {manifest.run_id} was refused before any rung ran"
+    elif status == "dry_run":
+        msg = f"run {manifest.run_id} is a dry run: nothing was sent, so there are no results"
+    elif status == "in_progress":
+        msg = f"run {manifest.run_id} has no results yet (in progress, or stopped before its first rung)"
+    else:
+        msg = f"run {manifest.run_id} ({status}) has no results"
+    print(msg + (f": {reason}" if reason else ""), file=sys.stderr)
+    return 1
+
+
 def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.cmd == "plan":
         spec = load_spec(args.spec, profile=args.profile)
@@ -182,10 +222,13 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             mem, basis = baseline_mem_available_from_rows(load_run(args.measured)), "measured baseline"
         elif spec.access.mode == "local":
             mem = local_mem_available_gib()
-        plan = make_plan(spec, mem_available_gib=mem, basis=basis)
+        plan = make_plan(
+            spec, mem_available_gib=mem, basis=basis,
+            max_model_len=args.max_model_len, kv_capacity_tokens=args.kv_capacity_tokens,
+        )
         print(describe_site())
         sys.stdout.write(format_plan(plan))
-        return 0 if plan.feasibility.ok else 1
+        return 0  # estimates are informational; nothing in a plan blocks a run
     if args.cmd == "run":
         spec = load_spec(args.spec, profile=args.profile)
         print(describe_site())
@@ -200,6 +243,7 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             resume=args.resume,
             ram_wait_min=args.ram_wait_min,
+            assume_yes=args.yes,
             no_site_config=args.no_site_config,
             variant=args.variant,
             pause_between_variants=args.pause_between_variants,
@@ -225,9 +269,11 @@ def _main(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         return 0
     if args.cmd == "report":
         run_path = args.run / "results.jsonl" if args.run.is_dir() else args.run
-        rows = load_run(run_path)
         man_path = run_path.parent / "manifest.json"
         manifest = RunManifest.load(man_path) if man_path.exists() else None
+        rows = load_run(run_path) if run_path.exists() else []
+        if not rows:
+            return _no_results(run_path, manifest)
         if args.html or args.html_out:
             out_html = args.html_out or run_path.parent / "report.html"
             out_html.write_text(render_html(rows, manifest), encoding="utf-8")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from xpu_llm_bench.spec import LoadMode, ProfileName, PromptType, RunSpec
+from xpu_llm_bench.spec import LoadMode, ProfileName, PromptType, RunSpec, ladder_contexts
 
 
 @dataclass(frozen=True)
@@ -56,18 +56,21 @@ def build_session1_then_join(spec: RunSpec) -> list[Rung]:
     """The progressive ladder. Per prompt type and load mode, on one boot:
 
     Phase S: session 1 grows through every context rung in one conversation
-    (append only, prefix cache reused). One measured rung per context.
+    (append only, prefix cache reused), up to the top rung (the server's
+    max_model_len minus headroom with ``context_rungs_tokens: auto``).
 
-    Phase C: with session 1 kept live at its high-water context, sessions join
-    one at a time at ``join_ctx_tokens`` (default: the first rung). A rung is
-    measured at each concurrency step > 1 with *every* live session decoding.
-    Joiners prefill one at a time before the window opens.
+    Phase C: for each concurrency step n > 1, n users join at the first rung
+    (each prefills on its own) and then grow together, rung by rung, with all
+    n decoding in every window, until the top rung or until that user count
+    stops fitting (the runner records CTX_CEILING and moves to the next user
+    count). Each user count has its own conversations, so all n users sit at
+    the same context: one clean curve per concurrency. A conversation only
+    ever grows (append-only, prefix reuse); earlier ones are released, never
+    shrunk or refilled.
     """
     ladder = spec.ladder
     out: list[Rung] = []
-    ctxs = list(ladder.context_rungs_tokens)
-    join = ladder.join_ctx_tokens or ctxs[0]
-    top = ctxs[-1]
+    ctxs = ladder_contexts(spec)
     for ptype in spec.prompts.types:
         for mode in ladder.load_modes:
             for ctx in ctxs:
@@ -88,32 +91,40 @@ def build_session1_then_join(spec: RunSpec) -> list[Rung]:
                         ctx_targets=(ctx,),
                     )
                 )
-            live = [1]
+            join = ladder.join_ctx_tokens or ctxs[0]
+            c_ctxs = [c for c in ctxs if c >= join] or ctxs[-1:]
+            if ladder.join_max_context_tokens:
+                c_ctxs = [c for c in c_ctxs if c <= ladder.join_max_context_tokens] or c_ctxs[:1]
+            next_sid = 2
             for n in ladder.concurrency_steps:
                 if n <= 1:
                     continue
-                grow: list[int] = []
-                while len(live) < n:
-                    live.append(len(live) + 1)
-                    grow.append(live[-1])
-                out.append(
-                    Rung(
-                        rung_id=_rung_id(ptype, mode, n, join, "C"),
-                        prompt_type=ptype,
-                        load_mode=mode,
-                        users=n,
-                        ctx_per_user=join,
-                        live_sessions=tuple(live),
-                        decoding_sessions=tuple(live),
-                        grow_sessions=tuple(grow),
-                        measures_prefill=bool(grow),
-                        output_tokens=ladder.output_tokens_per_rung,
-                        family=str(ptype),
-                        phase="C",
-                        ctx_targets=(top, *([join] * (len(live) - 1))),
+                group = tuple(range(next_sid, next_sid + n))
+                next_sid += n
+                for ctx in c_ctxs:
+                    out.append(
+                        Rung(
+                            rung_id=_rung_id(ptype, mode, n, ctx, "C"),
+                            prompt_type=ptype,
+                            load_mode=mode,
+                            users=n,
+                            ctx_per_user=ctx,
+                            live_sessions=group,
+                            decoding_sessions=group,
+                            grow_sessions=group,
+                            measures_prefill=True,
+                            output_tokens=ladder.output_tokens_per_rung,
+                            family=str(ptype),
+                            phase="C",
+                            ctx_targets=tuple([ctx] * n),
+                        )
                     )
-                )
     return out
+
+
+def ceiling_key(rung: Rung) -> str:
+    """Key of the (family, load mode, users) line a ceiling stops."""
+    return f"{rung.family}|{rung.load_mode}|{rung.users}"
 
 
 def build_schedule(spec: RunSpec, profile: ProfileName | None = None) -> list[Rung]:
@@ -146,7 +157,7 @@ def build_schedule(spec: RunSpec, profile: ProfileName | None = None) -> list[Ru
         for mode in ladder.load_modes:
             live: list[int] = []
             next_sid = 1
-            ctxs = list(ladder.context_rungs_tokens)
+            ctxs = ladder_contexts(spec)
             first = True
             for ctx in ctxs:
                 if first:

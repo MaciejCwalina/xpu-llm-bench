@@ -62,7 +62,8 @@ def test_runner_against_mock_server(mock_server, tmp_path: Path) -> None:
     manifest = runner.run()
     assert manifest.status == "completed"
     rows = read_jsonl(tmp_path / "out" / "results.jsonl")
-    assert len(rows) == 3  # progressive: 1u@64, 1u@128 (session 1 grows), then 2u join at 64
+    # progressive: 1u@64, 1u@128 (session 1 grows), then 2 users join at 64 and grow to 128
+    assert len(rows) == 4
     ids = [r.rung_id for r in rows]
     assert ids == sorted(ids, key=lambda x: ids.index(x))  # stable order
     assert {r.users for r in rows} == {1, 2}

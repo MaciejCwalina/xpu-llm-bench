@@ -2,9 +2,12 @@
 
 No JavaScript chart library, no CDN, no fonts or images from the network: the
 file opens offline. Each headline metric gets one chart per prompt type and
-load mode: X = context length per user (ladder order), Y = the metric, one
-line per concurrency (users). Flagged rows are drawn hollow; every point has
-an SVG <title> tooltip with the exact value and its flags.
+load mode: X = context length per user (log scale when the ladder spans a
+wide range), Y = the metric, one line per concurrency (users). A line ends at
+its user count's context ceiling (marker + tooltip with the reason). Flagged
+rows are drawn hollow; every point has an SVG <title> tooltip with the exact
+value and its flags. Each group shows its quality pass counts, and an
+"Average across prompt types" group averages the clean rows.
 """
 
 from __future__ import annotations
@@ -35,10 +38,23 @@ TABLE_COLUMNS = [
     "accepted_drafts_per_step", "hit_rate", "prefill_tok_s", "ttft_ms", "tpot_ms", "itl_p50_ms", "itl_p99_ms",
     "kv_cache_usage_max_pct", "mem_available_min_gib", "exit_reason", "flags", "valid",
 ]
+# Plain-words names for group headings.
+PROMPT_LABELS = {"code_edits": "Code edits", "long_form": "Long-form writing", "multi_turn_chat": "Multi-turn chat"}
+LOAD_LABELS = {"closed_all_decoding": "closed loop", "staggered": "staggered arrivals", "open_loop": "open loop"}
+# Metrics averaged across prompt types: (field, column title, scale).
+AVG_METRICS: list[tuple[str, str, float]] = [
+    ("decode_tok_s_per_user", "decode tok/s per user", 1.0),
+    ("steps_s_per_user", "steps/s per user", 1.0),
+    ("accepted_drafts_per_step", "accepted drafts/step", 1.0),
+    ("hit_rate", "true hit rate %", 100.0),
+    ("ttft_ms", "TTFT ms", 1.0),
+    ("prefill_tok_s", "prefill tok/s", 1.0),
+]
+AVG_LABEL = "average"
 # Series colours by users (works on light and dark backgrounds).
 PALETTE = ["#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e", "#17becf", "#8c564b", "#e377c2"]
-W, H = 520, 300
-ML, MR, MT, MB = 64, 16, 16, 46
+W, H = 520, 312
+ML, MR, MT, MB = 64, 22, 16, 58
 
 CSS = """
 :root{color-scheme:light dark;--bg:#fff;--fg:#1d1d1f;--muted:#6b6b70;--grid:#e3e3e8;--card:#f6f6f8;--bad:#b3261e}
@@ -57,7 +73,63 @@ pre{white-space:pre-wrap;word-break:break-all;background:var(--card);padding:8px
 .legend span{display:inline-flex;align-items:center;gap:4px}
 .note{background:var(--card);border-left:3px solid var(--muted);padding:6px 10px;margin:6px 0}
 .wide{overflow-x:auto}
+.qline{font-size:13px;margin:2px 0 8px}.qline b{font-weight:600}
+svg .ceil{stroke:var(--bad);stroke-width:2}
 """
+
+
+def group_label(prompt_type: str, load_mode: str) -> str:
+    """'Code edits, closed loop' rather than 'code_edits · closed_all_decoding'."""
+    if prompt_type == AVG_LABEL:
+        return f"Average across prompt types, {LOAD_LABELS.get(load_mode, load_mode)}"
+    return f"{PROMPT_LABELS.get(prompt_type, prompt_type.replace('_', ' ').capitalize())}, " \
+        f"{LOAD_LABELS.get(load_mode, load_mode.replace('_', ' '))}"
+
+
+# Quality checks: (label, getter returning True/False or None when the check did not run, suffix style)
+def _greedy(r: RungResult) -> bool | None:
+    g = r.quality.greedy_ref
+    if g in (None, "no_reference"):
+        return None
+    return g == "match"
+
+
+QUALITY_CHECKS: list[tuple[str, Any, str]] = [
+    ("Code edit", lambda r: r.quality.code_edit_pass, "pass"),
+    ("Needle", lambda r: r.quality.needle_pass, "pass"),
+    ("Format", lambda r: r.quality.format_ok, "pass"),
+    ("Greedy match", _greedy, ""),
+    ("Logprob", lambda r: r.quality.logprob_ok, "ok"),
+]
+
+
+def quality_counts(rows: list[RungResult]) -> list[tuple[str, int, int, str]]:
+    """(check, passed, ran, style) for every check that ran on at least one row (None = not run)."""
+    out = []
+    for label, get, style in QUALITY_CHECKS:
+        vals = [get(r) for r in rows]
+        ran = [v for v in vals if v is not None]
+        if ran:
+            out.append((label, sum(1 for v in ran if v), len(ran), style))
+    return out
+
+
+def quality_line(rows: list[RungResult]) -> str:
+    """'Code edit: 5 of 5 pass · Needle: 9 of 10 pass · ... · Logprob: ok 3 of 3' (text)."""
+    parts = []
+    for label, ok, ran, style in quality_counts(rows):
+        if style == "ok":
+            parts.append(f"{label}: ok {ok} of {ran}")
+        elif style:
+            parts.append(f"{label}: {ok} of {ran} {style}")
+        else:
+            parts.append(f"{label}: {ok} of {ran}")
+    return " · ".join(parts) if parts else "no quality checks ran"
+
+
+def _qline_html(rows: list[RungResult], prefix: str = "Quality") -> str:
+    bad = any(ok < ran for _, ok, ran, _ in quality_counts(rows))
+    return (f'<p class="qline{" bad" if bad else ""}"><b>{_e(prefix)}:</b> {_e(quality_line(rows))}</p>')
 
 
 def _e(x: Any) -> str:
@@ -69,8 +141,11 @@ def ctx_label(n: int | None) -> str:
         return "?"
     if n >= 1024 and n % 1024 == 0:
         k = n // 1024
-        # Project convention: 131072 reads "131K" (8192 -> 8K, 65536 -> 64K).
-        return f"{round(n / 1000)}K" if k >= 100 else f"{k}K"
+        # Project convention: 131072 reads "131K", 196608 "196K", 262144
+        # "262K" (thousands, rounded down); 8192 -> 8K, 65536 -> 64K.
+        return f"{n // 1000}K" if k >= 100 else f"{k}K"
+    if n >= 102400:
+        return f"{n // 1000}K"
     return f"{n / 1024:.1f}K" if n >= 1024 else str(n)
 
 
@@ -117,7 +192,7 @@ def _series(rows: list[RungResult], field: str, scale: float) -> dict[int, list[
     """users -> points ordered by context. Duplicate (users, ctx) rows are averaged."""
     acc: dict[tuple[int, int], list[RungResult]] = defaultdict(list)
     for r in rows:
-        if r.ctx_per_user is None:
+        if r.ctx_per_user is None or "CTX_CEILING" in r.flags and r.exit_reason == "CTX_CEILING":
             continue
         acc[(r.users, r.ctx_per_user)].append(r)
     out: dict[int, list[Point]] = defaultdict(list)
@@ -143,8 +218,13 @@ def svg_chart(
     unit: str,
     scale: float,
     users_order: list[int],
+    ceilings: dict[int, dict[str, Any]] | None = None,
 ) -> str:
-    """One chart. ``runs`` holds (label, rows); run 0 is solid, others dashed."""
+    """One chart. ``runs`` holds (label, rows); run 0 is solid, others dashed.
+
+    X is the context rungs that ran: log-scaled when the largest is 8x the
+    smallest or more, otherwise evenly spaced. ``ceilings`` (users -> ceiling
+    info) puts a marker at the end of that user count's line (run 0)."""
     data = [(label, _series(rows, field, scale)) for label, rows in runs]
     ctxs = sorted({p.ctx for _, s in data for pts in s.values() for p in pts})
     vals = [p.value for _, s in data for pts in s.values() for p in pts]
@@ -154,10 +234,18 @@ def svg_chart(
     top, step = _nice_max(max(vals))
     pw, ph = W - ML - MR, H - MT - MB
 
+    log_x = len(ctxs) > 1 and ctxs[-1] / max(ctxs[0], 1) >= 8
+
     def x(ctx: int) -> float:
         if len(ctxs) == 1:
             return ML + pw / 2
+        if log_x:
+            lo, hi = math.log2(ctxs[0]), math.log2(ctxs[-1])
+            return ML + pw * (math.log2(ctx) - lo) / (hi - lo)
         return ML + pw * ctxs.index(ctx) / (len(ctxs) - 1)
+
+    gaps = [x(b) - x(a) for a, b in zip(ctxs, ctxs[1:], strict=False)]
+    rotate = bool(gaps) and min(gaps) < 34
 
     def y(v: float) -> float:
         return MT + ph * (1 - v / top)
@@ -172,8 +260,13 @@ def svg_chart(
     parts.append(f'<line class="axis" x1="{ML}" x2="{ML}" y1="{MT}" y2="{MT + ph}"/>')
     parts.append(f'<line class="axis" x1="{ML}" x2="{W - MR}" y1="{MT + ph}" y2="{MT + ph}"/>')
     for c in ctxs:
-        parts.append(f'<text x="{x(c):.1f}" y="{MT + ph + 16}" text-anchor="middle">{ctx_label(c)}</text>')
-    parts.append(f'<text x="{ML + pw / 2:.1f}" y="{H - 8}" text-anchor="middle">context per user (tokens)</text>')
+        if rotate:
+            parts.append(f'<text transform="translate({x(c) + 4:.1f} {MT + ph + 12}) rotate(-40)" '
+                         f'text-anchor="end">{ctx_label(c)}</text>')
+        else:
+            parts.append(f'<text x="{x(c):.1f}" y="{MT + ph + 16}" text-anchor="middle">{ctx_label(c)}</text>')
+    parts.append(f'<text x="{ML + pw / 2:.1f}" y="{H - 6}" text-anchor="middle">context per user (tokens'
+                 f'{", log scale" if log_x else ""})</text>')
     parts.append(f'<text transform="translate(14 {MT + ph / 2:.1f}) rotate(-90)" text-anchor="middle">'
                  f'{_e(title)} ({_e(unit)})</text>')
     for ri, (label, series) in enumerate(data):
@@ -205,6 +298,21 @@ def svg_chart(
                 parts.append(f'{shape} class="pt{" hollow" if hollow else ""}" data-users="{users}" fill="{fill}" '
                              f'stroke="{col}" stroke-width="2"><title>{_e(tip)}</title>'
                              f'{"</rect>" if ri else "</circle>"}')
+            ceil = (ceilings or {}).get(users) if ri == 0 else None
+            if ceil:
+                last = pts[-1]
+                cx, cy = x(last.ctx), y(last.value)
+                tip = (f"{name}: context ceiling. Last measured {ctx_label(last.ctx)}"
+                       + (f"; stopped at {ctx_label(ceil['stopped_at'])}" if ceil.get("stopped_at") else "")
+                       + f" ({ceil.get('reason') or 'unknown'})"
+                       + (f"\n{ceil['detail']}" if ceil.get("detail") else ""))
+                parts.append(f'<g class="ceil-mark" data-users="{users}"><title>{_e(tip)}</title>'
+                             f'<line class="ceil" x1="{cx + 7:.1f}" x2="{cx + 7:.1f}" y1="{cy - 9:.1f}" '
+                             f'y2="{cy + 9:.1f}" stroke="{col}"/>'
+                             f'<line class="ceil" x1="{cx + 3:.1f}" x2="{cx + 11:.1f}" y1="{cy - 9:.1f}" '
+                             f'y2="{cy - 9:.1f}" stroke="{col}"/>'
+                             f'<line class="ceil" x1="{cx + 3:.1f}" x2="{cx + 11:.1f}" y1="{cy + 9:.1f}" '
+                             f'y2="{cy + 9:.1f}" stroke="{col}"/></g>')
     parts.append("</svg>")
     return head + "".join(parts) + "</div>"
 
@@ -222,7 +330,86 @@ def _legend(users_order: list[int], labels: list[str]) -> str:
                          "</span>")
     items.append('<span><svg width="12" height="12"><circle cx="6" cy="6" r="4" fill="none" stroke="currentColor" '
                  'stroke-width="2"/></svg>hollow = flagged or invalid row (hover for flags)</span>')
+    items.append('<span><svg width="14" height="20"><g stroke="currentColor" stroke-width="2"><line x1="7" x2="7" '
+                 'y1="1" y2="19"/><line x1="3" x2="11" y1="1" y2="1"/><line x1="3" x2="11" y1="19" y2="19"/></g>'
+                 '</svg>line ends at that user count\'s context ceiling (hover for the reason)</span>')
     return '<div class="legend">' + "".join(items) + "</div>"
+
+
+def ctx_ceilings(rows: list[RungResult], manifest: RunManifest | None) -> dict[tuple[str, str, int], dict[str, Any]]:
+    """(prompt type, load mode, users) -> {max_ok_ctx, stopped_at, reason, detail}.
+
+    From manifest.ctx_ceilings, else from rows flagged CTX_CEILING."""
+    out: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for v in ((manifest.ctx_ceilings if manifest else {}) or {}).values():
+        out[(v.get("family"), v.get("load_mode"), int(v.get("users") or 0))] = dict(v)
+    for r in rows:
+        key = (r.prompt_type, r.load_mode, r.users)
+        if "CTX_CEILING" in r.flags and key not in out:
+            ok = [x.ctx_per_user for x in rows if (x.prompt_type, x.load_mode, x.users) == key
+                  and x.valid != "invalid" and x.ctx_per_user < r.ctx_per_user]
+            out[key] = {"max_ok_ctx": max(ok) if ok else None, "stopped_at": r.ctx_per_user,
+                        "reason": (r.exit_reason or "").lower(), "detail": r.reason}
+    return out
+
+
+def _clean(r: RungResult) -> bool:
+    """Rows used for averages: valid and carrying no flag at all."""
+    return r.valid == "valid" and not r.flags
+
+
+def average_rows(rows: list[RungResult]) -> tuple[list[RungResult], list[dict[str, Any]]]:
+    """Average clean rows across prompt types, per load mode, users and context.
+
+    Only (load mode, users, context) cells where EVERY prompt type of that load
+    mode has a clean row are averaged. Returns synthetic rows (prompt_type
+    "average", for the chart group) and table records."""
+    types_by_mode: dict[str, set[str]] = defaultdict(set)
+    for r in rows:
+        if r.prompt_type != AVG_LABEL:
+            types_by_mode[r.load_mode].add(r.prompt_type)
+    cells: dict[tuple[str, int, int], dict[str, list[RungResult]]] = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        if _clean(r) and r.prompt_type != AVG_LABEL:
+            cells[(r.load_mode, r.users, r.ctx_per_user)][r.prompt_type].append(r)
+    avg_rows: list[RungResult] = []
+    table: list[dict[str, Any]] = []
+    for (mode, users, ctx), by_type in sorted(cells.items()):
+        types = types_by_mode[mode]
+        if len(types) < 2 or set(by_type) != types:
+            continue
+        rec: dict[str, Any] = {"load_mode": mode, "users": users, "ctx": ctx, "types": sorted(types)}
+        vals: dict[str, float | None] = {}
+        for field, _title, _scale in AVG_METRICS:
+            per_type = []
+            for t in sorted(types):
+                nums = [float(getattr(x, field)) for x in by_type[t] if isinstance(getattr(x, field), (int, float))]
+                if nums:
+                    per_type.append(sum(nums) / len(nums))
+            vals[field] = sum(per_type) / len(per_type) if len(per_type) == len(types) else None
+        rec.update(vals)
+        table.append(rec)
+        avg_rows.append(RungResult.model_construct(
+            run_id="average", rung_id=f"average of {len(types)} prompt types:{mode}:{users}u:{ctx}",
+            users=users, ctx_per_user=ctx, ctx_tokens=[], prompt_type=AVG_LABEL, load_mode=mode,
+            flags=[], valid="valid", exit_reason=None, **vals,
+        ))
+    return avg_rows, table
+
+
+def averages_table(table: list[dict[str, Any]]) -> str:
+    if not table:
+        return ('<p class="muted">No (users, context) cell has a clean row in every prompt type, so there is '
+                "nothing to average.</p>")
+    head = "<th>load</th><th>users</th><th>context</th>" + "".join(f"<th>{_e(t)}</th>" for _, t, _ in AVG_METRICS)
+    body = []
+    for rec in table:
+        cells = [LOAD_LABELS.get(rec["load_mode"], rec["load_mode"]), str(rec["users"]), ctx_label(rec["ctx"])]
+        for field, _t, scale in AVG_METRICS:
+            v = rec.get(field)
+            cells.append(_fmt(v * scale) if isinstance(v, (int, float)) else "n/a")
+        body.append("<tr>" + "".join(f"<td>{_e(c)}</td>" for c in cells) + "</tr>")
+    return f'<div class="wide"><table><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
 
 
 def has_spec_decode(rows: list[RungResult], manifest: RunManifest | None) -> bool:
@@ -251,6 +438,32 @@ def numbers_table(rows: list[RungResult]) -> str:
         cls = ' class="bad"' if (HOLLOW_FLAGS & set(r.flags)) or r.valid != "valid" else ""
         body.append(f"<tr{cls}>" + "".join(f"<td>{_e(_cell(r, c))}</td>" for c in TABLE_COLUMNS) + "</tr>")
     return f'<div class="wide"><table><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
+
+
+def context_reach(rows: list[RungResult], manifest: RunManifest | None) -> str:
+    """Per load mode and users: highest context measured (all prompt types) and the ceiling, if any."""
+    ceil = ctx_ceilings(rows, manifest)
+    top = max(((manifest.context_rungs if manifest else None) or [r.ctx_per_user for r in rows]), default=None)
+    keys = sorted({(r.load_mode, r.users) for r in rows if r.prompt_type != AVG_LABEL})
+    if not keys or top is None:
+        return ""
+    body = []
+    for mode, users in keys:
+        mine = [r for r in rows if (r.load_mode, r.users) == (mode, users) and r.valid != "invalid"
+                and not (r.exit_reason == "CTX_CEILING")]
+        reached = max((r.ctx_per_user for r in mine), default=None)
+        stops = sorted({(v.get("stopped_at"), v.get("reason")) for (pt, lm, u), v in ceil.items()
+                        if lm == mode and u == users})
+        if stops:
+            what = "; ".join(f"stopped at {ctx_label(s)} ({rs})" for s, rs in stops)
+        elif reached == top:
+            what = "reached the top rung"
+        else:
+            what = "did not reach the top rung (run incomplete)"
+        body.append(f"<tr><td>{_e(LOAD_LABELS.get(mode, mode))}</td><td>{users}</td>"
+                    f"<td>{_e(ctx_label(reached) if reached else 'none')}</td><td>{_e(what)}</td></tr>")
+    return ("<table><thead><tr><th>load</th><th>users</th><th>max context measured</th><th>ceiling</th></tr>"
+            f"</thead><tbody>{''.join(body)}</tbody></table>")
 
 
 def _kv_table(items: list[tuple[str, Any]]) -> str:
@@ -308,10 +521,29 @@ def _header(rows: list[RungResult], manifest: RunManifest | None) -> str:
         ("speculative decoding", (f"{getattr(sp, 'method', None)} k={m.k if m else None}" if sp else "none declared")
          + (f"; boot log: {boot.get('spec_method')} k={boot.get('spec_k')}" if boot.get("spec_method") else "")),
     ]
+    if m and (m.max_model_len or m.context_rungs):
+        items.append(("context ladder",
+                      f"max_model_len {m.max_model_len or 'unknown'}"
+                      + (f" (from {m.max_model_len_source})" if m.max_model_len_source else "")
+                      + (f"; rungs {', '.join(ctx_label(c) for c in m.context_rungs)}" if m.context_rungs else "")
+                      + (f"; {m.context_note}" if m.context_note else "")))
+    if m and m.kv_capacity_tokens:
+        items.append(("KV capacity", f"{m.kv_capacity_tokens:,} tokens (from {m.kv_capacity_source})"))
+    if m and m.pre_run_load:
+        pl = m.pre_run_load
+        items.append(("pre-run load",
+                      ("busy/loaded: " if pl.get("loaded") else "idle: ")
+                      + f"{pl.get('requests_running', 0):.0f} running, {pl.get('requests_waiting', 0):.0f} waiting, "
+                      f"{pl.get('generation_tokens_in_probe') or 0:.0f} tokens generated in {pl.get('probe_s', 0):.0f}s, "
+                      f"KV {pl.get('kv_cache_usage_pct') or 0:.1f}%" if pl.get("checked") else "not checked"))
     if hw is not None:
         items.append(("hardware", f"host {hw.host}, GPU {hw.gpu_model} x{hw.gpu_count or '?'}, TP {hw.tensor_parallel or '?'}, "
                                   f"host RAM {hw.host_ram_gib or '?'} GiB, MemAvailable floor {hw.mem_available_floor_gib} GiB"))
     out.append(_kv_table(items))
+    reach = context_reach(rows, manifest)
+    if reach:
+        out.append("<h3>Context reached per user count</h3>")
+        out.append(reach)
     # Launch: how the server was started (captured read-only at preflight).
     out.append("<h3>Server launch</h3>")
     if launch:
@@ -367,6 +599,7 @@ def render_html(
     users_order = sorted({r.users for r in all_rows})
     groups = sorted({(r.prompt_type, r.load_mode) for r in all_rows})
     spec_on = any(has_spec_decode(rs, manifest if i == 0 else None) for i, (_, rs) in enumerate(runs))
+    ceilings = ctx_ceilings(rows, manifest)
     ttl = title or f"xpu-llm-bench report — {label0}"
     out = [
         "<!DOCTYPE html>",
@@ -376,6 +609,7 @@ def render_html(
         f"<h1>{_e(ttl)}</h1>",
         f'<p class="muted">{len(all_rows)} rows. Charts: X = context per user, one line per concurrency. '
         "Hover a point for the exact value. Self-contained file: no scripts, no network assets.</p>",
+        _qline_html(rows, "Quality, all rows"),
         "<h2>Run</h2>",
         _header(rows, manifest),
     ]
@@ -390,14 +624,40 @@ def render_html(
     if not all_rows:
         out.append('<p class="muted">No rows.</p>')
     for pt, lm in groups:
-        out.append(f"<h3>{_e(pt)} · {_e(lm)}</h3><div class=\"grid\">")
+        group_rows = [r for r in rows if (r.prompt_type, r.load_mode) == (pt, lm)]
+        out.append(f"<h3>{_e(group_label(pt, lm))}</h3>")
+        out.append(_qline_html(group_rows))
+        out.append('<div class="grid">')
+        gceil = {u: v for (p_, l_, u), v in ceilings.items() if (p_, l_) == (pt, lm)}
         for field, mtitle, unit, scale, needs_spec in METRICS:
             if needs_spec and not spec_on:
                 continue
             sub = [(lab, [r for r in rs if (r.prompt_type, r.load_mode) == (pt, lm)]) for lab, rs in runs]
-            out.append(svg_chart(sub, field, mtitle, unit, scale, users_order))
+            out.append(svg_chart(sub, field, mtitle, unit, scale, users_order, gceil))
         out.append("</div>")
+    avg_rows, avg_table = average_rows(rows)
+    if len({r.prompt_type for r in rows}) > 1:
+        out.append("<h2>Averages across prompt types</h2>")
+        out.append('<p class="note">Mean of the per-prompt-type values for each load mode, user count and context '
+                   "rung that has a clean row in every prompt type ("
+                   + _e(", ".join(sorted({PROMPT_LABELS.get(r.prompt_type, r.prompt_type) for r in rows})))
+                   + "). Flagged and invalid rows are excluded, so a cell where any prompt type was flagged or "
+                   "failed is left out rather than averaged over fewer types.</p>")
+        out.append(averages_table(avg_table))
+        for lm in sorted({r.load_mode for r in avg_rows}):
+            mode_rows = [r for r in avg_rows if r.load_mode == lm]
+            out.append(f"<h3>{_e(group_label(AVG_LABEL, lm))}</h3><div class=\"grid\">")
+            for field, mtitle, unit, scale, needs_spec in METRICS:
+                if needs_spec and not spec_on:
+                    continue
+                out.append(svg_chart([("average", mode_rows)], field, mtitle, unit, scale, users_order))
+            out.append("</div>")
     out.append("<h2>All numbers</h2>")
+    if groups:
+        out.append('<div class="note"><b>Quality pass counts per group</b><ul>' + "".join(
+            f"<li>{_e(group_label(pt, lm))}: "
+            f"{_e(quality_line([r for r in rows if (r.prompt_type, r.load_mode) == (pt, lm)]))}</li>"
+            for pt, lm in groups) + "</ul></div>")
     for lab, rs in runs:
         if len(runs) > 1:
             out.append(f"<h3>{_e(lab)}</h3>")

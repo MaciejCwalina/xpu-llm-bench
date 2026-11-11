@@ -213,15 +213,19 @@ LadderShape = Literal["session1_then_join", "grid"]
 
 
 class LadderSpec(BaseModel):
-    # session1_then_join (the progressive ladder): boot once; session 1 grows through
-    # every context rung in one conversation; then sessions join one at a time
-    # at join_ctx_tokens while earlier sessions stay live and keep decoding.
+    # session1_then_join (the progressive ladder): boot once; session 1 grows
+    # through every context rung in one conversation; then, for each
+    # concurrency step, that many users join at join_ctx_tokens and grow
+    # together rung by rung until the top rung or the user count's ceiling.
     # grid: the original scaffold order (all concurrencies at the first rung,
     # then grow everyone and quiesce down). It starts at the widest point
     # (every user at once), so it is refused unless allow_grid is also true.
     shape: LadderShape = "session1_then_join"
     allow_grid: bool = False
-    join_ctx_tokens: int | None = None  # default: first context rung
+    join_ctx_tokens: int | None = None  # where joining users start; default: first context rung
+    # Cap for multi-user rungs (None: they climb to the top rung like session 1).
+    # The quick profile sets 8192 so 2/4/8 users stay short.
+    join_max_context_tokens: int | None = None
     # Sampling for measured windows. Greedy keeps A/B workloads identical and
     # makes MTP on/off divergence checks meaningful.
     temperature: float = 0.0
@@ -232,9 +236,26 @@ class LadderSpec(BaseModel):
     min_window_steps: int = 20
     # Poll /metrics this often during a window (running / waiting / KV).
     metrics_poll_s: float = 1.0
-    context_rungs_tokens: list[int] = Field(
-        default_factory=lambda: [8192, 32768, 65536, 131072]
-    )
+    # "auto" (default): 8K, 32K, 64K, 131K, then +auto_step_tokens (196K,
+    # 262K, ...) up to the server's max_model_len (read from /v1/models or the
+    # boot log at preflight) minus ctx_headroom_tokens, with that maximum as
+    # the final rung. Or pin an explicit increasing list.
+    context_rungs_tokens: list[int] | Literal["auto"] = "auto"
+    # Optional cap for the ladder (auto or explicit), e.g. to stop below the
+    # server's max_model_len. None: the server's max_model_len decides.
+    max_context: int | None = None
+    auto_base_tokens: list[int] = Field(default_factory=lambda: [8192, 32768, 65536, 131072])
+    # After the base rungs: "add" auto_step_tokens per rung, "double", or
+    # "auto" (add up to 262144 = 196K, 262K, then double: 524K, 1M, ...).
+    auto_step_tokens: int = 65536
+    auto_step_mode: Literal["add", "double", "auto"] = "auto"
+    # Room left under max_model_len for the question and the output window.
+    # None: output_tokens_per_rung + 1024.
+    ctx_headroom_tokens: int | None = None
+    # Keep climbing each user count until it stops fitting (KV capacity, the
+    # server rejects the context, RAM floor, OOM); record CTX_CEILING and move
+    # on to the next user count instead of aborting the run.
+    stop_at_ceiling: bool = True
     concurrency_steps: list[int] = Field(default_factory=lambda: [1, 2, 4, 8])
     load_modes: list[LoadMode] = Field(default_factory=lambda: ["closed_all_decoding"])
     open_loop: OpenLoopSettings = Field(default_factory=OpenLoopSettings)
@@ -249,7 +270,9 @@ class LadderSpec(BaseModel):
 
     @field_validator("context_rungs_tokens")
     @classmethod
-    def _rungs_increasing(cls, v: list[int]) -> list[int]:
+    def _rungs_increasing(cls, v: list[int] | str) -> list[int] | str:
+        if v == "auto":
+            return v
         if not v or any(n <= 0 for n in v):
             raise ValueError("context_rungs_tokens must be a non-empty list of positive ints")
         if v != sorted(v):
@@ -441,7 +464,10 @@ QUICK_PROFILE: dict[str, Any] = {
         # steps: the shortest window that still clears min_window_steps.
         "output_tokens_per_rung": 96,
         "warmup": {"tokens": 8, "requests": 1},
-        "target_minutes": 10.0,
+        # Quick: 2/4/8 users measured at 8K only (session 1 still grows to 32K);
+        # 8 x 32K would triple the prefill time for a smoke run.
+        "join_max_context_tokens": 8192,
+        "target_minutes": 12.0,
     },
 }
 
@@ -449,7 +475,7 @@ FULL_PROFILE: dict[str, Any] = {
     "profile": "full",
     "ladder": {
         "shape": "session1_then_join",
-        "context_rungs_tokens": [8192, 32768, 65536, 131072],
+        "context_rungs_tokens": "auto",
         "concurrency_steps": [1, 2, 4, 8],
         "load_modes": ["closed_all_decoding", "staggered"],
         "output_tokens_per_rung": 256,
@@ -587,3 +613,75 @@ def spec_placeholders(spec: RunSpec) -> list[str]:
 
     walk(spec.model_dump(), "")
     return found
+
+
+# ---------------------------------------------------------------------------
+# Context ladder resolution
+# ---------------------------------------------------------------------------
+AUTO_UNKNOWN_TOP = 131072  # what `auto` shows before the server's max_model_len is known
+
+
+def ctx_headroom(ladder: LadderSpec) -> int:
+    if ladder.ctx_headroom_tokens is not None:
+        return ladder.ctx_headroom_tokens
+    return ladder.output_tokens_per_rung + 1024
+
+
+def resolve_contexts(ladder: LadderSpec, max_model_len: int | None = None) -> tuple[list[int], str]:
+    """Context rungs for this run and a one-line note on where they came from.
+
+    The limit is ``min(max_model_len - headroom, ladder.max_context)`` over the
+    values that are known. Auto rungs: ``auto_base_tokens``, then
+    ``auto_step_tokens`` steps, every rung below the limit, plus the limit
+    itself (rounded down to 1K) as the final rung. Explicit lists are kept
+    but rungs above the limit are dropped.
+    """
+    limits = []
+    if max_model_len:
+        limits.append(max_model_len - ctx_headroom(ladder))
+    if ladder.max_context:
+        limits.append(ladder.max_context)
+    limit = min(limits) if limits else None
+    if limit is not None:
+        limit = max(limit, 1)
+        if limit >= 16384:
+            limit = limit // 1024 * 1024  # a round final rung (260096, not 260992)
+    src = (f"max_model_len={max_model_len}" if max_model_len else "") + (
+        f"{', ' if max_model_len else ''}max_context={ladder.max_context}" if ladder.max_context else "")
+    if ladder.context_rungs_tokens != "auto":
+        ctxs = list(ladder.context_rungs_tokens)
+        if limit is None:
+            return ctxs, "explicit context rungs"
+        kept = [c for c in ctxs if c <= limit] or [min(ctxs[0], limit)]
+        dropped = [c for c in ctxs if c > limit]
+        note = "explicit context rungs" + (f"; dropped {dropped} above the limit {limit} ({src})" if dropped else "")
+        return kept, note
+    base = sorted(set(ladder.auto_base_tokens))
+    if limit is None:
+        return [c for c in base if c <= AUTO_UNKNOWN_TOP] or base[:1], (
+            f"auto: server max_model_len not known yet, showing rungs up to {AUTO_UNKNOWN_TOP // 1000}K; "
+            "a live run extends them to max_model_len at preflight (or set ladder.max_context / --max-context)"
+        )
+    seq = list(base)
+    nxt = seq[-1]
+    while nxt < limit:
+        double = ladder.auto_step_mode == "double" or (ladder.auto_step_mode == "auto" and nxt >= 262144)
+        nxt = nxt * 2 if double else nxt + ladder.auto_step_tokens
+        seq.append(nxt)
+    gap = min(4096, limit // 32)  # drop a step rung that sits right under the final one
+    ctxs = [c for c in seq if c <= limit - gap]
+    ctxs.append(limit)
+    return ctxs, f"auto: up to {limit} ({src} minus {ctx_headroom(ladder)} headroom)" if max_model_len else (
+        f"auto: up to {limit} ({src})")
+
+
+def with_contexts(spec: RunSpec, ctxs: list[int]) -> RunSpec:
+    """Copy of ``spec`` with an explicit, resolved context list."""
+    data = spec.model_dump()
+    data["ladder"]["context_rungs_tokens"] = list(ctxs)
+    return RunSpec.model_validate(data)
+
+
+def ladder_contexts(spec: RunSpec) -> list[int]:
+    """Resolved context rungs using only what the spec knows (no server)."""
+    return resolve_contexts(spec.ladder, None)[0]

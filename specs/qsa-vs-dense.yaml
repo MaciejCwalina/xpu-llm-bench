@@ -40,10 +40,9 @@ prompts:
 ladder:
   # Progressive: session 1 grows through every context rung, then users join.
   shape: session1_then_join
-  # Progressive schedule still grows 8K then 131K (and optionally mid rungs).
-  # 32K/64K omitted here to keep this A/B closer to the four historical cells;
-  # use qsa-full-fix-mtp6 + prod-dense-baseline for the complete matrix.
-  context_rungs_tokens: [8192, 131072]
+  # Climbs to the server's max context (the historical cells 8K and 131K are
+  # rungs of the auto ladder); each user count stops at its own ceiling.
+  context_rungs_tokens: auto  # 8K, 32K, 64K, 131K, 196K, 262K, ... up to the server max_model_len
   concurrency_steps: [1, 2, 4, 8]
   load_modes: [closed_all_decoding]
   output_tokens_per_rung: 128

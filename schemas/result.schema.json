@@ -395,6 +395,25 @@
           "title": "Config",
           "type": "object"
         },
+        "context_note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Context Note"
+        },
+        "context_rungs": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Context Rungs",
+          "type": "array"
+        },
         "corpus_files": {
           "additionalProperties": {
             "items": {
@@ -404,6 +423,21 @@
             "type": "array"
           },
           "title": "Corpus Files",
+          "type": "object"
+        },
+        "ctx_ceilings": {
+          "additionalProperties": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Ctx Ceilings",
+          "type": "object"
+        },
+        "ctx_reached": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Ctx Reached",
           "type": "object"
         },
         "decode_method": {
@@ -531,6 +565,30 @@
           "default": null,
           "title": "K"
         },
+        "kv_capacity_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kv Capacity Source"
+        },
+        "kv_capacity_tokens": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Kv Capacity Tokens"
+        },
         "kv_format": {
           "anyOf": [
             {
@@ -552,6 +610,30 @@
           "additionalProperties": true,
           "title": "Launch Check",
           "type": "object"
+        },
+        "max_model_len": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Model Len"
+        },
+        "max_model_len_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Model Len Source"
         },
         "notes": {
           "items": {
@@ -578,6 +660,11 @@
           },
           "title": "Planned Rung Ids",
           "type": "array"
+        },
+        "pre_run_load": {
+          "additionalProperties": true,
+          "title": "Pre Run Load",
+          "type": "object"
         },
         "profile": {
           "title": "Profile",
@@ -786,6 +873,18 @@
           },
           "title": "Capture Sizes",
           "type": "array"
+        },
+        "ctx_fill_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ctx Fill Pct"
         },
         "ctx_per_user": {
           "title": "Ctx Per User",

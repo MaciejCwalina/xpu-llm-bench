@@ -4,13 +4,98 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from xpu_llm_bench.schedule import Rung, build_schedule, peak_live_tokens, validate_progressive
-from xpu_llm_bench.spec import RunSpec
+from xpu_llm_bench.schedule import (
+    Rung,
+    build_schedule,
+    ceiling_key,
+    peak_live_tokens,
+    validate_progressive,
+)
+from xpu_llm_bench.spec import RunSpec, resolve_contexts, with_contexts
 
 GiB = 1024 ** 3
 
 
 FeasStatus = str  # "ok" | "tight" | "fail"
+
+
+@dataclass
+class CeilingEstimate:
+    """Estimated context ceiling of one (family, load mode, users) line."""
+
+    key: str
+    family: str
+    load_mode: str
+    users: int
+    top_ok: int | None  # highest rung estimated to fit (None: not even the first)
+    stops_at: int | None  # first rung estimated not to fit (None: reaches the top)
+    reason: str  # "fits" or "kv_capacity"
+    limit_tokens_per_user: int | None = None  # KV capacity / users - output window
+
+
+def rung_kv_tokens(rung: Rung) -> int:
+    """KV tokens a rung needs at once: every live context plus each decoder's output window."""
+    return sum(rung.target_for(s) for s in rung.live_sessions) + len(rung.decoding_sessions) * rung.output_tokens
+
+
+def kv_capacity_estimate(spec: RunSpec) -> int | None:
+    """KV token capacity from the planner's GPU assumptions (None if GPU size is unknown).
+
+    A live run uses the server's own figure (boot log "KV cache size: N tokens"
+    or vllm:cache_config_info) instead.
+    """
+    a = spec.planner
+    hw = spec.hardware
+    if not hw.gpu_count or not hw.gpu_mem_gib or a.assumed_kv_bytes_per_token <= 0:
+        return None
+    free = hw.gpu_count * hw.gpu_mem_gib * a.gpu_fail_frac - a.assumed_weight_gib - a.assumed_fixed_overhead_gib
+    return max(0, int(free * GiB / a.assumed_kv_bytes_per_token))
+
+
+def ceiling_estimates(
+    spec: RunSpec,
+    rungs: list[Rung],
+    kv_capacity_tokens: int | None = None,
+    mem_available_gib: float | None = None,
+) -> list[CeilingEstimate]:
+    """Per (family, load mode, users): the highest rung that fits.
+
+    A rung fits when its live KV tokens (``rung_kv_tokens``) fit the KV
+    capacity and its host-RAM growth (live tokens x planner.host_bytes_per_token
+    plus any host KV share) fits MemAvailable minus the floor. Unknown limits
+    are not checked. Lines climb rung by rung, so the first rung that does not
+    fit is the estimated ceiling.
+    """
+    a = spec.planner
+    host_budget = None
+    if mem_available_gib is not None:
+        host_budget = mem_available_gib - spec.hardware.mem_available_floor_gib
+    by_key: dict[str, list[Rung]] = {}
+    for r in rungs:
+        by_key.setdefault(ceiling_key(r), []).append(r)
+    out: list[CeilingEstimate] = []
+    for key, rs in by_key.items():
+        rs = sorted(rs, key=lambda r: r.ctx_per_user)
+        top_ok = None
+        stops_at = None
+        reason = "fits"
+        for r in rs:
+            kv_tokens = rung_kv_tokens(r)
+            live = sum(r.target_for(s) for s in r.live_sessions)
+            host_need = (live * a.host_bytes_per_token + kv_tokens * a.assumed_kv_bytes_per_token * a.host_kv_fraction) / GiB
+            if kv_capacity_tokens is not None and kv_tokens > kv_capacity_tokens:
+                stops_at, reason = r.ctx_per_user, "kv_capacity"
+                break
+            if host_budget is not None and host_need > host_budget:
+                stops_at, reason = r.ctx_per_user, "host_ram"
+                break
+            top_ok = r.ctx_per_user
+        users = rs[0].users
+        limit = None
+        if kv_capacity_tokens is not None:
+            limit = kv_capacity_tokens // users - rs[0].output_tokens
+        out.append(CeilingEstimate(key, rs[0].family, rs[0].load_mode, users, top_ok, stops_at, reason, limit))
+    return out
 
 
 @dataclass
@@ -28,14 +113,20 @@ class Feasibility:
     host_status: FeasStatus = "ok"
     host_basis: str = "estimate"  # "estimate" or "measured"
     notes: list[str] = field(default_factory=list)
+    ceilings: list[CeilingEstimate] = field(default_factory=list)
+    kv_capacity_tokens: int | None = None
+    kv_capacity_basis: str = ""
 
     @property
     def ok(self) -> bool:
-        return self.gpu_status != "fail" and self.host_status != "fail"
+        """Whether the ESTIMATES fit. Informational: neither GPU nor host
+        estimates block a run; live ceilings stop a user count instead."""
+        return self.gpu_status != "fail"
 
     @property
     def failures(self) -> list[str]:
-        return [n for n in self.notes if n.startswith("FAIL")]
+        # Estimates never block a run (pre-run checks only look at live load).
+        return []
 
 @dataclass
 class Plan:
@@ -47,6 +138,9 @@ class Plan:
     fits_target: bool | None
     feasibility: Feasibility
     issues: list[str] = field(default_factory=list)
+    contexts: list[int] = field(default_factory=list)
+    context_note: str = ""
+    max_model_len: int | None = None
 
     @property
     def estimated_minutes(self) -> float:
@@ -84,6 +178,8 @@ def feasibility(
     rungs: list[Rung],
     mem_available_gib: float | None = None,
     basis: str = "live",
+    kv_capacity_tokens: int | None = None,
+    kv_capacity_basis: str = "",
 ) -> Feasibility:
     """GPU and host-RAM feasibility of the planned peak.
 
@@ -100,14 +196,34 @@ def feasibility(
     """
     a = spec.planner
     hw = spec.hardware
+    ceilings: list[CeilingEstimate] = []
+    ceiling_notes: list[str] = []
+    if kv_capacity_tokens is None:
+        kv_capacity_tokens = kv_capacity_estimate(spec)
+        if kv_capacity_tokens is not None:
+            kv_capacity_basis = "planner estimate (hardware.gpu_* and planner.assumed_*)"
+    if spec.ladder.stop_at_ceiling and spec.ladder.shape != "grid":
+        # Each user count climbs until it stops fitting, then the run records
+        # CTX_CEILING and moves on. Check fit on the rungs estimated to fit;
+        # the live run finds the real ceilings.
+        ceilings = ceiling_estimates(spec, rungs, kv_capacity_tokens)
+        tops = {c.key: c.top_ok for c in ceilings}
+        fitting = [r for r in rungs if tops.get(ceiling_key(r)) is not None and r.ctx_per_user <= tops[ceiling_key(r)]]
+        stopped = [c for c in ceilings if c.stops_at is not None]
+        if stopped:
+            ceiling_notes.append(
+                f"{len(stopped)} user-count line(s) are estimated to stop below the top rung (see the ceiling "
+                "table). The run climbs each line until it stops fitting, records CTX_CEILING and continues "
+                "with the next user count; the GPU and host checks below cover the rungs estimated to fit."
+            )
+        rungs = fitting or rungs[:1]
     peak_tokens = peak_live_tokens(rungs)
     kv = (peak_tokens * a.assumed_kv_bytes_per_token) / GiB
     gpu_need = kv + a.assumed_weight_gib + a.assumed_fixed_overhead_gib
     notes = [
         "KV, GPU and per-token host-RAM figures are planner ESTIMATES (planner.*), not measurements.",
-        "Host RAM floor is MemAvailable, not a cgroup max. A run aborts if MemAvailable hits the floor.",
         "Peak live tokens assumes sessions stay resident when quiesced (prefix cache retained).",
-    ]
+    ] + ceiling_notes
     gpu_total = 0.0
     if not hw.gpu_count or not hw.gpu_mem_gib:
         gpu_status = "unknown"
@@ -120,7 +236,7 @@ def feasibility(
         if gpu_need > gpu_total * a.gpu_fail_frac:
             gpu_status = "fail"
             notes.append(
-                f"FAIL GPU: estimated weights+KV+overhead {gpu_need:.1f} GiB exceeds "
+                f"WARN GPU (estimate, does not block): estimated weights+KV+overhead {gpu_need:.1f} GiB exceeds "
                 f"{a.gpu_fail_frac:.0%} of {gpu_total:.0f} GiB ({hw.gpu_count} x {hw.gpu_mem_gib:.0f} GiB). "
                 "Lower the top context rung or concurrency."
             )
@@ -135,29 +251,18 @@ def feasibility(
 
     host_need = (peak_tokens * a.host_bytes_per_token) / GiB + kv * a.host_kv_fraction
     floor = hw.mem_available_floor_gib
+    # Host RAM: an ESTIMATE shown for information only. It never blocks a run,
+    # a user count or a bigger ladder; the live RAM floor (runtime) stops a
+    # user count instead and records CTX_CEILING.
     if mem_available_gib is None:
         host_status, host_basis, host_budget = "unverified", "none", 0.0
-        notes.append(
-            f"WARN host RAM: no MemAvailable reading, so the run's estimated host growth "
-            f"({host_need:.1f} GiB) is NOT checked. Plan on the bench host (access.mode local), pass "
-            "`--mem-available GIB` or `--measured <results.jsonl>`; a live run re-checks at preflight."
-        )
     else:
         host_basis = basis
         host_budget = mem_available_gib - floor
         if host_need > host_budget:
-            host_status = "fail"
-            notes.append(
-                f"FAIL host RAM: estimated growth {host_need:.1f} GiB (peak {peak_tokens:,} live tokens x "
-                f"{a.host_bytes_per_token / 1024:.0f} KiB) exceeds MemAvailable {mem_available_gib:.1f} GiB "
-                f"({basis}) minus the {floor:.1f} GiB floor = {host_budget:.1f} GiB."
-            )
+            host_status = "over"
         elif host_budget - host_need < a.host_tight_gib:
             host_status = "tight"
-            notes.append(
-                f"WARN host RAM: estimated growth {host_need:.1f} GiB leaves only "
-                f"{host_budget - host_need:.1f} GiB above the floor (MemAvailable {mem_available_gib:.1f} GiB, {basis})."
-            )
         else:
             host_status = "ok"
     return Feasibility(
@@ -166,7 +271,7 @@ def feasibility(
         estimated_total_gib=gpu_need,
         host_ram_gib=hw.host_ram_gib or 0.0,
         mem_floor_gib=floor,
-        host_ram_ok=host_status != "fail",
+        host_ram_ok=host_status != "over",
         gpu_total_gib=gpu_total,
         gpu_status=gpu_status,
         host_need_gib=host_need,
@@ -174,6 +279,9 @@ def feasibility(
         host_status=host_status,
         host_basis=host_basis,
         notes=notes,
+        ceilings=ceilings,
+        kv_capacity_tokens=kv_capacity_tokens,
+        kv_capacity_basis=kv_capacity_basis,
     )
 
 
@@ -205,7 +313,15 @@ GRID_WARNING = (
 )
 
 
-def make_plan(spec: RunSpec, mem_available_gib: float | None = None, basis: str = "live") -> Plan:
+def make_plan(
+    spec: RunSpec,
+    mem_available_gib: float | None = None,
+    basis: str = "live",
+    max_model_len: int | None = None,
+    kv_capacity_tokens: int | None = None,
+) -> Plan:
+    ctxs, ctx_note = resolve_contexts(spec.ladder, max_model_len)
+    spec = with_contexts(spec, ctxs)
     rungs = build_schedule(spec)
     issues = validate_progressive(rungs)
     if spec.ladder.shape == "grid":
@@ -225,8 +341,14 @@ def make_plan(spec: RunSpec, mem_available_gib: float | None = None, basis: str 
         estimated_seconds=seconds,
         target_minutes=target,
         fits_target=fits,
-        feasibility=(feas := feasibility(spec, rungs, mem_available_gib, basis)),
+        feasibility=(feas := feasibility(
+            spec, rungs, mem_available_gib, basis, kv_capacity_tokens,
+            "given" if kv_capacity_tokens is not None else "",
+        )),
         issues=issues + feas.failures,
+        contexts=ctxs,
+        context_note=ctx_note,
+        max_model_len=max_model_len,
     )
 
 
@@ -238,6 +360,11 @@ def format_plan(plan: Plan) -> str:
         lines.append(GRID_WARNING)
         lines.append("")
     lines.append(f"Rungs: {len(plan.rungs)}  phases={sorted({r.phase for r in plan.rungs})}")
+    if plan.contexts:
+        lines.append(
+            "Context rungs: " + ", ".join(ctx_k(c) for c in plan.contexts)
+            + (f"  ({plan.context_note})" if plan.context_note else "")
+        )
     lines.append(
         f"Estimated wall time: {plan.estimated_minutes:.1f} min "
         f"({plan.estimated_seconds:.0f} s)"
@@ -253,18 +380,32 @@ def format_plan(plan: Plan) -> str:
         f"Peak live tokens: {feas.peak_live_tokens:,}  "
         f"est. KV: {feas.estimated_kv_gib:.2f} GiB  "
         f"est. GPU weights+KV+overhead: {feas.estimated_total_gib:.2f} / "
-        f"{(f'{feas.gpu_total_gib:.0f}' if feas.gpu_total_gib else '?')} GiB ({feas.gpu_status.upper()})"
+        f"{(f'{feas.gpu_total_gib:.0f}' if feas.gpu_total_gib else '?')} GiB ({'OVER, estimate only' if feas.gpu_status == 'fail' else feas.gpu_status.upper()})"
     )
     if feas.host_status == "unverified":
         lines.append(
-            f"Host RAM: est. growth {feas.host_need_gib:.1f} GiB vs MemAvailable: no reading (UNVERIFIED)"
+            f"Host RAM (info only, never blocks): est. growth {feas.host_need_gib:.1f} GiB; no MemAvailable reading"
         )
     else:
         lines.append(
-            f"Host RAM: est. growth {feas.host_need_gib:.1f} GiB of {feas.host_budget_gib:.1f} GiB "
-            f"(MemAvailable {feas.host_budget_gib + feas.mem_floor_gib:.1f} GiB {feas.host_basis} minus a "
-            f"{feas.mem_floor_gib:.1f} GiB floor) ({feas.host_status.upper()})"
+            f"Host RAM (info only, never blocks): est. growth {feas.host_need_gib:.1f} GiB vs "
+            f"{feas.host_budget_gib:.1f} GiB above the {feas.mem_floor_gib:.1f} GiB floor "
+            f"(MemAvailable {feas.host_budget_gib + feas.mem_floor_gib:.1f} GiB {feas.host_basis}) "
+            f"({feas.host_status.upper()}). A live run stops a user count at the RAM floor (CTX_CEILING)."
         )
+    if feas.ceilings:
+        lines.append("")
+        cap = (f"{feas.kv_capacity_tokens:,} tokens ({feas.kv_capacity_basis})"
+               if feas.kv_capacity_tokens is not None else "unknown (set hardware.gpu_* or pass --kv-capacity-tokens)")
+        lines.append(f"Context ceiling per user count (ESTIMATE; KV capacity {cap}):")
+        for c in feas.ceilings:
+            top = ctx_k(c.top_ok) if c.top_ok else "none"
+            if c.stops_at is None:
+                verdict = f"reaches the top rung ({top})"
+            else:
+                verdict = f"up to {top}, stops at {ctx_k(c.stops_at)} ({c.reason})"
+            per_user = f"; ~{c.limit_tokens_per_user:,} tokens/user fit" if c.limit_tokens_per_user is not None else ""
+            lines.append(f"  {c.family} {c.load_mode} {c.users}u: {verdict}{per_user}")
     lines.append("")
     lines.append(
         "Order (progressive; context never shrinks within a prompt-type family):"
@@ -294,3 +435,11 @@ def format_plan(plan: Plan) -> str:
         lines.append(f"- {note}")
     lines.append("")
     return "\n".join(lines)
+
+
+
+def ctx_k(n: int) -> str:
+    """Context label, same convention as the HTML report: 8K, 64K, 131K, 196K, 262K."""
+    from xpu_llm_bench.html_report import ctx_label
+
+    return ctx_label(n)
